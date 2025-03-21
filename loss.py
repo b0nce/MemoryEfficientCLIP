@@ -276,6 +276,6 @@ class MemoryEfficientCLIPLoss(nn.Module):
             text_features = F.normalize(text_features, dim=1)
         
         # Apply custom CLIP loss function
-        loss = CLIPLossNormed.apply(image_features, text_features, self.temperature)
+        loss = MemoryEfficientCLIPLossNormed.apply(image_features, text_features, self.temperature)
         
         return loss
