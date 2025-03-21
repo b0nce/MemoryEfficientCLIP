@@ -64,7 +64,7 @@ These are wrapped by a PyTorch autograd Function (`MemoryEfficientCLIPLossNormed
 If you use this implementation in your research, please cite:
 
 ```
-@misc{triton-optimized-clip-loss,
+@misc{memory-efficient-clip-loss,
   author = {Mikhail Kindulov},
   title = {Memory Efficient CLIP Loss},
   year = {2025},
