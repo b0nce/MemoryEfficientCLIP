@@ -1,6 +1,9 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import triton
 import triton.language as tl
-import torch
+
 
 @triton.jit
 def clip_sum_exp_kernel(
@@ -125,7 +128,7 @@ def clip_grad_kernel(
     probs += S / sum_exp_col[None, :]
     
     # Compute combined gradient
-    tl.static_assert(BLOCK_SIZE_I == BLOCK_SIZE_J)
+    tl.static_assert(BLOCK_SIZE_I == BLOCK_SIZE_J) # TODO: make more robust
     if pid_i == pid_j:
         # Create diagonal mask for identity elements
         diag_mask = (i_offsets[:, None] == j_offsets[None, :])
@@ -163,46 +166,116 @@ def clip_grad_kernel(
         tl.atomic_add(dY_ptr + Y_addrs, dY_contrib, mask=j_mask[:, None] & d_mask[None, :], sem="relaxed")
 
 
-def clip_loss_gradients_triton(X, Y, temperature=0.07, block_size=64):
-    assert X.is_cuda and Y.is_cuda
-    assert X.shape == Y.shape
-    batch_size, d_model = X.shape
-    device = X.device
+class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x_normalized, y_normalized, temperature=0.07):
+        """Forward pass for CLIP loss."""
+        X = x_normalized
+        Y = y_normalized
+        
+        assert X.is_cuda and Y.is_cuda
+        assert X.shape == Y.shape
+
+        batch_size, d_model = X.shape
+        device = X.device
+        
+        # Hardcoded for now
+        BLOCK_SIZE_D = min(64, d_model)
+        
+        err_msg_pow2 = "Triton kernel cant work with tensors with non power of two dimensions"
+        err_msg_lt16 = "Triton kernel cant work with tensors with dimensions <16"
+        
+        assert triton.next_power_of_2(BLOCK_SIZE_D) == BLOCK_SIZE_D, err_msg_pow2
+        assert BLOCK_SIZE_D >= 16, err_msg_lt16
+        
+        inv_temp = 1.0 / temperature
+
+        # Initialize sum buffers
+        sum_exp_row = torch.zeros(batch_size, device=device)
+        sum_exp_col = torch.zeros(batch_size, device=device)
+        
+        # Compute sum_exp
+        grid = (triton.cdiv(batch_size, 128), triton.cdiv(batch_size, 128))
+        clip_sum_exp_kernel[grid](
+            X, Y, sum_exp_row, sum_exp_col,
+            batch_size, inv_temp,
+            BLOCK_SIZE_I=128,
+            BLOCK_SIZE_J=128,
+            BLOCK_SIZE_D=64,
+            D_MODEL=d_model,
+        )
+
+        ctx.save_for_backward(X, Y, sum_exp_row, sum_exp_col)
+        ctx.inv_temp = inv_temp
+        ctx.batch_size = batch_size
+        ctx.d_model = d_model  # Save d_model for backward pass
+
+        # TODO: save loss during sum computation, or at least create a separate fused kernel
+        Sv = torch.einsum('bi,bi->b', X, Y) * inv_temp - inv_temp
+        
+        logits = torch.log(torch.exp(Sv) / sum_exp_row.flatten())
+        logits += torch.log(torch.exp(Sv) / sum_exp_col.flatten())
+        
+        loss = -logits.mean() / 2.0
+        
+        return loss
     
-    inv_temp = 1.0 / temperature
-    BLOCK_SIZE_I = block_size
-    BLOCK_SIZE_J = block_size
-    BLOCK_SIZE_D = min(block_size, d_model)
-    
-    # Initialize sum buffers
-    sum_exp_row = torch.zeros(batch_size, device=device)
-    sum_exp_col = torch.zeros(batch_size, device=device)
-    
-    # Compute sum_exp
-    grid = (triton.cdiv(batch_size, 128), triton.cdiv(batch_size, 128))
-    clip_sum_exp_kernel[grid](
-        X, Y, sum_exp_row, sum_exp_col,
-        batch_size, inv_temp,
-        BLOCK_SIZE_I=128,
-        BLOCK_SIZE_J=128,
-        BLOCK_SIZE_D=64,
-        D_MODEL=d_model,
-    )
-    
-    # Initialize gradients
-    dX = torch.zeros_like(X)
-    dY = torch.zeros_like(Y)
-    
-    # Compute gradients
-    grid = (triton.cdiv(batch_size, BLOCK_SIZE_I), triton.cdiv(batch_size, BLOCK_SIZE_J))
-    clip_grad_kernel[grid](
-        X, Y, sum_exp_row, sum_exp_col,
-        dX, dY,
-        batch_size, inv_temp,
-        BLOCK_SIZE_I=BLOCK_SIZE_I,
-        BLOCK_SIZE_J=BLOCK_SIZE_J,
-        BLOCK_SIZE_D=BLOCK_SIZE_D,
-        D_MODEL=d_model,
-    )
-    
-    return dX, dY
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Backward pass for CLIP loss."""
+        X, Y, sum_exp_row, sum_exp_col = ctx.saved_tensors
+        inv_temp = ctx.inv_temp
+        batch_size = ctx.batch_size
+        d_model = ctx.d_model
+        
+        # Hardcoded block sizes for now
+        BLOCK_SIZE_I = 64
+        BLOCK_SIZE_J = 64
+        BLOCK_SIZE_D = min(64, d_model)
+        assert BLOCK_SIZE_I == BLOCK_SIZE_J, "Should be equal for correct loss computation, check TODO"
+
+        err_msg_pow2 = "Triton kernel cant work with tensors with non power of two dimensions"
+        err_msg_lt16 = "Triton kernel cant work with tensors with dimensions <16"
+        assert triton.next_power_of_2(BLOCK_SIZE_D) == BLOCK_SIZE_D, err_msg_pow2
+        assert BLOCK_SIZE_D >= 16, err_msg_lt16
+        
+        device = X.device
+        
+        # Initialize gradients
+        dX = torch.zeros_like(X)
+        dY = torch.zeros_like(Y)
+        
+        # Compute gradients
+        grid = (triton.cdiv(batch_size, BLOCK_SIZE_I), triton.cdiv(batch_size, BLOCK_SIZE_J))
+        clip_grad_kernel[grid](
+            X, Y, sum_exp_row, sum_exp_col,
+            dX, dY,
+            batch_size, inv_temp,
+            BLOCK_SIZE_I=BLOCK_SIZE_I,
+            BLOCK_SIZE_J=BLOCK_SIZE_J,
+            BLOCK_SIZE_D=BLOCK_SIZE_D,
+            D_MODEL=d_model,
+        )
+        
+        # Scale gradients by grad_output (which is typically 1.0)
+        if grad_output != 1.0:
+            dX = dX * grad_output
+            dY = dY * grad_output
+            
+        return dX, dY, None
+
+class MemoryEfficientCLIPLoss(nn.Module):
+    def __init__(self, temperature=0.07, normalized_inputs=False):
+        super().__init__()
+        self.temperature = temperature
+        self.normalized_inputs = normalized_inputs
+        
+    def forward(self, image_features, text_features):
+        if not self.normalized_inputs:
+            image_features = F.normalize(image_features, dim=1)
+            text_features = F.normalize(text_features, dim=1)
+        
+        # Apply custom CLIP loss function
+        loss = MemoryEfficientCLIPLossNormed.apply(image_features, text_features, self.temperature)
+        
+        return loss
