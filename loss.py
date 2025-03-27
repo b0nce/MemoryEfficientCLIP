@@ -14,6 +14,7 @@ def clip_sum_exp_kernel(
     BLOCK_SIZE_D: tl.constexpr,
     D_MODEL: tl.constexpr,
 ):
+    
     pid_i = tl.program_id(0)
     pid_j = tl.program_id(1)
     
@@ -26,10 +27,6 @@ def clip_sum_exp_kernel(
     # Validity masks for batch dimensions
     i_mask = i_offsets < batch_size
     j_mask = j_offsets < batch_size
-    
-    # Initialize accumulators for exp(S) sums
-    exp_S_row_acc = tl.zeros([BLOCK_SIZE_I], dtype=tl.float32)
-    exp_S_col_acc = tl.zeros([BLOCK_SIZE_J], dtype=tl.float32)
     
     # Initialize partial similarity matrix
     S_partial = tl.zeros([BLOCK_SIZE_I, BLOCK_SIZE_J], dtype=tl.float32)
@@ -55,10 +52,7 @@ def clip_sum_exp_kernel(
         S_partial += tl.dot(X_block, tl.trans(Y_block))
     
     # Apply temperature scaling
-    S = S_partial * inv_temperature
-    
-    # Compute exponentials (inv_temperature is stable enough as maximum for softmax)
-    exp_S = tl.exp(S - inv_temperature)
+    exp_S = tl.exp2(S_partial * inv_temperature - inv_temperature)
     
     # Compute sum over axis
     rows_sum_exp_S = tl.sum(exp_S, axis=1)
@@ -73,7 +67,8 @@ def clip_sum_exp_kernel(
 def clip_grad_kernel(
     X_ptr, Y_ptr, sum_exp_row_ptr, sum_exp_col_ptr,
     dX_ptr, dY_ptr,
-    batch_size, inv_temperature,
+    inv_temperature, inv_temperature_orig,
+    batch_size, 
     BLOCK_SIZE_I: tl.constexpr,
     BLOCK_SIZE_J: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
@@ -105,37 +100,27 @@ def clip_grad_kernel(
         X_block = tl.load(
             X_ptr + (i_offsets[:, None] * D_MODEL + d_offsets[None, :]),
             mask=(i_mask[:, None] & d_mask[None, :]),
-            other=0.0
+            other=0.0,
         )
         Y_block = tl.load(
             Y_ptr + (j_offsets[:, None] * D_MODEL + d_offsets[None, :]),
             mask=(j_mask[:, None] & d_mask[None, :]),
-            other=0.0
+            other=0.0,
         )
         
         # Accumulate partial dot products for similarity matrix
-        S_partial += tl.dot(X_block, tl.trans(Y_block))
-    
-    # Apply temperature scaling to get full similarity matrix
-    S = tl.exp(S_partial * inv_temperature - inv_temperature)
+        S_partial = tl.dot(X_block, tl.trans(Y_block), S_partial)
+
+    exp_S = tl.exp2(S_partial * inv_temperature - inv_temperature)
     
     # Load precomputed sums
     sum_exp_row = tl.load(sum_exp_row_ptr + i_offsets, mask=i_mask, other=1.0)
     sum_exp_col = tl.load(sum_exp_col_ptr + j_offsets, mask=j_mask, other=1.0)
+
+    probs = tl.math.fdiv(exp_S, sum_exp_row[:, None]) + \
+            tl.math.fdiv(exp_S, sum_exp_col[None, :])
     
-    # Compute probabilities
-    probs = S / sum_exp_row[:, None]
-    probs += S / sum_exp_col[None, :]
-    
-    # Compute combined gradient
-    tl.static_assert(BLOCK_SIZE_I == BLOCK_SIZE_J) # TODO: make more robust
-    if pid_i == pid_j:
-        # Create diagonal mask for identity elements
-        diag_mask = (i_offsets[:, None] == j_offsets[None, :])
-        diag_mask = diag_mask.to(tl.float32)
-        grad = (probs - 2 * diag_mask) * (inv_temperature / (2 * batch_size))
-    else:
-        grad = probs * (inv_temperature / (2 * batch_size))
+    grad = probs * (inv_temperature_orig / (2 * batch_size))
     
     # Process gradients for all feature dimensions
     for d_start in range(0, D_MODEL, BLOCK_SIZE_D):
@@ -146,12 +131,16 @@ def clip_grad_kernel(
         Y_block = tl.load(
             Y_ptr + (j_offsets[:, None] * D_MODEL + d_offsets[None, :]),
             mask=(j_mask[:, None] & d_mask[None, :]),
-            other=0.0
+            other=0.0,
+            cache_modifier='.cg',
+            eviction_policy="evict_first",
         )
         X_block = tl.load(
             X_ptr + (i_offsets[:, None] * D_MODEL + d_offsets[None, :]),
             mask=(i_mask[:, None] & d_mask[None, :]),
-            other=0.0
+            other=0.0,
+            cache_modifier='.cg',
+            eviction_policy="evict_first",
         )
         
         # Calculate gradient contributions for this feature chunk
@@ -188,7 +177,8 @@ class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
         assert triton.next_power_of_2(BLOCK_SIZE_D) == BLOCK_SIZE_D, err_msg_pow2
         assert BLOCK_SIZE_D >= 16, err_msg_lt16
         
-        inv_temp = 1.0 / temperature
+        inv_temp = 1.4426950408889634 / temperature
+        inv_temp_orig = 1 / temperature
 
         # Initialize sum buffers
         sum_exp_row = torch.zeros(batch_size, device=device)
@@ -207,6 +197,7 @@ class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
 
         ctx.save_for_backward(X, Y, sum_exp_row, sum_exp_col)
         ctx.inv_temp = inv_temp
+        ctx.inv_temp_orig = inv_temp_orig
         ctx.batch_size = batch_size
         ctx.d_model = d_model  # Save d_model for backward pass
 
@@ -225,6 +216,7 @@ class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
         """Backward pass for CLIP loss."""
         X, Y, sum_exp_row, sum_exp_col = ctx.saved_tensors
         inv_temp = ctx.inv_temp
+        inv_temp_orig = ctx.inv_temp_orig
         batch_size = ctx.batch_size
         d_model = ctx.d_model
         
@@ -232,25 +224,23 @@ class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
         BLOCK_SIZE_I = 64
         BLOCK_SIZE_J = 64
         BLOCK_SIZE_D = min(64, d_model)
-        assert BLOCK_SIZE_I == BLOCK_SIZE_J, "Should be equal for correct loss computation, check TODO"
 
         err_msg_pow2 = "Triton kernel cant work with tensors with non power of two dimensions"
         err_msg_lt16 = "Triton kernel cant work with tensors with dimensions <16"
         assert triton.next_power_of_2(BLOCK_SIZE_D) == BLOCK_SIZE_D, err_msg_pow2
         assert BLOCK_SIZE_D >= 16, err_msg_lt16
         
-        device = X.device
-        
         # Initialize gradients
-        dX = torch.zeros_like(X)
-        dY = torch.zeros_like(Y)
+        dX = Y.clone().mul_(-inv_temp_orig / batch_size)
+        dY = X.clone().mul_(-inv_temp_orig / batch_size)
         
         # Compute gradients
         grid = (triton.cdiv(batch_size, BLOCK_SIZE_I), triton.cdiv(batch_size, BLOCK_SIZE_J))
         clip_grad_kernel[grid](
             X, Y, sum_exp_row, sum_exp_col,
             dX, dY,
-            batch_size, inv_temp,
+            inv_temp, inv_temp_orig,
+            batch_size,
             BLOCK_SIZE_I=BLOCK_SIZE_I,
             BLOCK_SIZE_J=BLOCK_SIZE_J,
             BLOCK_SIZE_D=BLOCK_SIZE_D,
@@ -263,6 +253,7 @@ class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
             dY = dY * grad_output
             
         return dX, dY, None
+
 
 class MemoryEfficientCLIPLoss(nn.Module):
     def __init__(self, temperature=0.07, normalized_inputs=False):
