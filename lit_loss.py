@@ -286,7 +286,7 @@ class StableMemoryEfficientLiTLossNormed(torch.autograd.Function):
         assert BLOCK_SIZE_D >= 16, err_msg_lt16
         
         inv_temp = 1.4426950408889634 / temperature
-        inv_temp_orig = math.sqrt(1 / temperature)
+        inv_temp_orig = math.sqrt(batch_size / temperature)
 
         # Initialize sum buffers
         sum_exp_row = torch.zeros(batch_size, device=device)
