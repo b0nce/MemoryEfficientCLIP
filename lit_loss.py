@@ -198,7 +198,7 @@ class MemoryEfficientLiTLossNormed(torch.autograd.Function):
         # TODO: save loss during sum computation, or at least create a separate fused kernel
         Sv = torch.einsum('bi,bi->b', X, Y) * inv_temp - inv_temp
         
-        logits = torch.log(torch.exp(Sv) / sum_exp_row.flatten())
+        logits = torch.log(torch.exp2(Sv) / sum_exp_row.flatten())
         
         loss = -logits.mean()
         
@@ -313,7 +313,7 @@ class StableMemoryEfficientLiTLossNormed(torch.autograd.Function):
         # TODO: save loss during sum computation, or at least create a separate fused kernel
         Sv = torch.einsum('bi,bi->b', X, Y) * inv_temp - inv_temp
         
-        logits = torch.log(torch.exp(Sv) / sum_exp_row.flatten())
+        logits = torch.log(torch.exp2(Sv) / sum_exp_row.flatten())
         
         loss = -logits.mean()
         
