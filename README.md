@@ -64,6 +64,61 @@ image_features = torch.randn(batch_size, dim, device="cuda")
 loss = lit_loss(text_features, image_features)
 ```
 
+### Distributed CLIP Loss (multi-GPU DDP)
+
+```python
+import torch
+import torch.distributed as dist
+from distributed_clip_loss import DistributedMemoryEfficientCLIPLoss
+
+# One process per GPU, e.g. launched with torchrun.
+dist.init_process_group("nccl")
+torch.cuda.set_device(dist.get_rank())
+
+clip_loss = DistributedMemoryEfficientCLIPLoss(temperature=0.07)
+
+# Each rank passes ONLY its shard of the global batch.
+local_batch, dim = 2 ** 15, 1152
+image_features = torch.randn(local_batch, dim, device="cuda", requires_grad=True)
+text_features = torch.randn(local_batch, dim, device="cuda", requires_grad=True)
+
+# forward returns this rank's contribution; backward fills the shard's full gradient.
+partial_loss = clip_loss(image_features, text_features)
+partial_loss.backward()
+
+# Sum the partial losses across ranks for the global scalar (logging only).
+global_loss = partial_loss.detach().clone()
+dist.all_reduce(global_loss)
+```
+
+### Distributed LiT Loss (multi-GPU DDP)
+
+```python
+import torch
+import torch.distributed as dist
+from distributed_lit_loss import DistributedMemoryEfficientLiTLoss
+
+# One process per GPU, e.g. launched with torchrun.
+dist.init_process_group("nccl")
+torch.cuda.set_device(dist.get_rank())
+
+lit_loss = DistributedMemoryEfficientLiTLoss(temperature=0.07)
+
+# Each rank passes ONLY its shard of the global batch. The image tower is locked,
+# so only the text features receive a gradient.
+local_batch, dim = 2 ** 15, 1152
+text_features = torch.randn(local_batch, dim, device="cuda", requires_grad=True)
+image_features = torch.randn(local_batch, dim, device="cuda")
+
+partial_loss = lit_loss(text_features, image_features)
+partial_loss.backward()
+
+global_loss = partial_loss.detach().clone()
+dist.all_reduce(global_loss)
+```
+
+Both distributed modules accept `normalized_inputs=True` (skip the internal L2 normalize) and `stable=True` (the large-batch gradient rescaling described below), and take fp32, fp16, or bf16 features.
+
 ## Requirements
 
 - PyTorch >= 1.10
@@ -91,6 +146,24 @@ The LiT implementation also uses two main Triton kernels:
 2. `lit_grad_kernel`: Computes gradients efficiently for text features only during backpropagation, as LiT (Locked-image text Tuning) is designed to train text encoders while keeping image encoders fixed
 
 Both implementations are wrapped by PyTorch autograd Functions and nn.Modules for easy integration into PyTorch workflows.
+
+### Distributed CLIP Loss
+
+`distributed_clip_loss.py` shards the global batch one contiguous slice per rank and never materializes the full similarity matrix or gathers per-sample gradients. Each rank keeps its own rows at home; only the column (text) tower travels, rotating around a SigLIP-style ring of point-to-point transfers. Every block is prefetched one hop ahead so its transfer overlaps the current block's matmul.
+
+1. `clip_denom_kernel`: a fused rectangular sum-exp for one ring block, accumulating the row and column denominators as the column tower rotates. Row denominators complete locally; the column denominators are a single O(batch) all-reduce.
+2. `clip_grad_both_kernel`: computes each similarity block once over the local rows and emits both gradient directions from that pass. The local-row gradient is final; the column gradient is delivered to its owning shard with a reduce-scatter. Backward tile sizes are selected per GPU architecture.
+
+`forward` returns the local rank's contribution to the loss (all-reduce SUM for the global value); `backward` produces the complete gradient of the global loss for the local shard. Communication is O(batch) against O(batch^2) compute. Denominators and gradients accumulate in fp32 regardless of the input precision, keeping fp16/bf16 features numerically safe.
+
+### Distributed LiT Loss
+
+`distributed_lit_loss.py` uses the same sharded ring, specialized to LiT's locked image tower. Because only the text tower trains and its gradient sums over the locked image columns, each rank keeps its text rows at home and streams only the image features past them. Every rank therefore accumulates its shard's complete text gradient locally, with no gradient communication and without ever assembling the full towers, so peak memory stays proportional to the per-rank shard.
+
+1. `lit_denom_kernel`: the row-only sum-exp for one image block (the loss is unidirectional, so there is no column denominator).
+2. `lit_grad_kernel`: a single output GEMM that accumulates the text gradient for one image block; the image features receive no gradient.
+
+The image features stream past the home texts twice, once to complete the row denominators and once for the gradient. As with the distributed CLIP loss, `forward` returns the local partial loss and `backward` fills the local shard's text gradient, with fp32 accumulation for fp16/bf16 inputs.
 
 ## Differences between CLIP and LiT
 
