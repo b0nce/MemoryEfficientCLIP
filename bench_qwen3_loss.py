@@ -1,9 +1,9 @@
-"""Timing, peak memory, and torch.profiler traces for the embedding loss.
+"""Timing, peak memory, and torch.profiler traces for the Qwen3 loss.
 
-Single GPU:  python bench_embedding_loss.py [--local-batch N] [--dim D] [--k K]
-Multi GPU:   torchrun --nproc-per-node=4 bench_embedding_loss.py
+Single GPU:  python bench_qwen3_loss.py [--local-batch N] [--dim D] [--k K]
+Multi GPU:   torchrun --nproc-per-node=4 bench_qwen3_loss.py
 
-Runs the embedding-loss variants (plain q->d, +hard negatives, +qq/dd) plus the CLIP
+Runs the Qwen3-loss variants (plain q->d, +hard negatives, +qq/dd) plus the CLIP
 loss as a baseline, prints ms/iter (forward+backward) and peak memory, and exports one
 chrome trace per config to ./traces/ (openable in chrome://tracing or Perfetto).
 """
@@ -14,10 +14,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.profiler import profile, schedule, ProfilerActivity
 
-from clip_embedding_loss import (
-    MemoryEfficientEmbeddingLoss, DistributedMemoryEfficientEmbeddingLoss)
-from lit_embedding_loss import (
-    MemoryEfficientLiTEmbeddingLoss, DistributedMemoryEfficientLiTEmbeddingLoss)
+from clip_qwen3_loss import (
+    MemoryEfficientQwen3Loss, DistributedMemoryEfficientQwen3Loss)
+from lit_qwen3_loss import (
+    MemoryEfficientLiTQwen3Loss, DistributedMemoryEfficientLiTQwen3Loss)
 from clip_loss import MemoryEfficientCLIPLoss
 from distributed_clip_loss import DistributedMemoryEfficientCLIPLoss
 
@@ -26,16 +26,21 @@ PROF_STEPS = 6                              # profiler: wait=1, warmup=2, active
 
 
 def make_config_list(distributed):
-    emb = DistributedMemoryEfficientEmbeddingLoss if distributed else MemoryEfficientEmbeddingLoss
-    lit = (DistributedMemoryEfficientLiTEmbeddingLoss if distributed
-           else MemoryEfficientLiTEmbeddingLoss)
+    qwen3 = DistributedMemoryEfficientQwen3Loss if distributed else MemoryEfficientQwen3Loss
+    lit = (DistributedMemoryEfficientLiTQwen3Loss if distributed
+           else MemoryEfficientLiTQwen3Loss)
     clip = DistributedMemoryEfficientCLIPLoss if distributed else MemoryEfficientCLIPLoss
     return [
         ("clip_baseline", clip(temperature=0.05, normalized_inputs=True), False),
-        ("emb_base", emb(temperature=0.05, margin=0.1, normalized_inputs=True), False),
-        ("emb_hardneg", emb(temperature=0.05, margin=0.1, normalized_inputs=True), True),
-        ("emb_full_qq_dd", emb(temperature=0.05, margin=0.1, use_qq_negatives=True,
-                               use_dd_negatives=True, normalized_inputs=True), True),
+        ("clip_debiased", clip(temperature=0.05, normalized_inputs=True,
+                               tau_plus=0.1), False),
+        ("qwen3_base", qwen3(temperature=0.05, margin=0.1, normalized_inputs=True), False),
+        ("qwen3_hardneg", qwen3(temperature=0.05, margin=0.1, normalized_inputs=True), True),
+        ("qwen3_full_qq_dd", qwen3(temperature=0.05, margin=0.1, use_qq_negatives=True,
+                                   use_dd_negatives=True, normalized_inputs=True), True),
+        ("qwen3_debiased", qwen3(temperature=0.05, margin=0.1, use_qq_negatives=True,
+                                 use_dd_negatives=True, normalized_inputs=True,
+                                 tau_plus=0.1), True),
         ("lit_hardneg", lit(temperature=0.05, margin=0.1, normalized_inputs=True), True),
         ("lit_qq", lit(temperature=0.05, margin=0.1, use_qq_negatives=True,
                        normalized_inputs=True), True),

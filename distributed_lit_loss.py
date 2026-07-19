@@ -30,8 +30,10 @@ try:
         INPUT_PRECISION,           # tf32 by default, MEMEFF_INPUT_PRECISION overrides
         LN2 as _LN2,
         check_dims as _check_dims,
+        debias_denominators as _debias_denominators,
         ring_post as _ring_post,
         validate_features as _validate_features,
+        validate_tau_plus as _validate_tau_plus,
         world_and_rank as _world_and_rank,
     )
 except ImportError:   # running as a flat module from inside the repo
@@ -39,8 +41,10 @@ except ImportError:   # running as a flat module from inside the repo
         INPUT_PRECISION,
         LN2 as _LN2,
         check_dims as _check_dims,
+        debias_denominators as _debias_denominators,
         ring_post as _ring_post,
         validate_features as _validate_features,
+        validate_tau_plus as _validate_tau_plus,
         world_and_rank as _world_and_rank,
     )
 
@@ -159,7 +163,8 @@ def _launch_grad(x_text, y_block, sum_exp_row, scale, dX, inv_temperature):
 
 class DistributedMemoryEfficientLiTLossNormed(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_text, y_img, inv_temperature, scale, batch_size, group):
+    def forward(ctx, x_text, y_img, inv_temperature, scale, tau_plus, floor,
+                batch_size, group):
         world, rank = _world_and_rank(group)
         send_to, recv_from = (rank + 1) % world, (rank - 1) % world
 
@@ -177,37 +182,50 @@ class DistributedMemoryEfficientLiTLossNormed(torch.autograd.Function):
                     req.wait()
                 cur_y = recv_y
 
-        ctx.save_for_backward(x_text, y_img, sum_exp_row)
-        ctx.inv_temperature, ctx.scale, ctx.group = inv_temperature, scale, group
-        ctx.batch_size, ctx.in_dtype = batch_size, x_text.dtype
-
         # partial loss over the HOME diagonal (home text . home image), formed directly from
         # the log2-domain logit (log(exp2(s)) = ln2 * s) so no exponential is materialized.
+        # The row denominators are complete locally, so the debiased transform is too.
         sv = (x_text.float() * y_img.float()).sum(dim=1) * inv_temperature - inv_temperature
-        return -(sv * _LN2 - torch.log(sum_exp_row)).sum() / batch_size
+        denom, div, seed = sum_exp_row, sum_exp_row, None
+        if tau_plus:
+            denom, div, seed = _debias_denominators(
+                torch.exp2(sv), sum_exp_row, batch_size - 1, tau_plus, floor)
+
+        saved = (x_text, y_img, div) + (() if seed is None else (seed,))
+        ctx.save_for_backward(*saved)
+        ctx.debiased = seed is not None
+        ctx.inv_temperature, ctx.scale, ctx.group = inv_temperature, scale, group
+        ctx.batch_size, ctx.in_dtype = batch_size, x_text.dtype
+        return -(sv * _LN2 - torch.log(denom)).sum() / batch_size
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_text, y_img, sum_exp_row = ctx.saved_tensors
+        if ctx.debiased:
+            x_text, y_img, div, seed = ctx.saved_tensors
+        else:
+            (x_text, y_img, div), seed = ctx.saved_tensors, None
         scale, group = ctx.scale, ctx.group
         world, rank = _world_and_rank(group)
         send_to, recv_from = (rank + 1) % world, (rank - 1) % world
 
-        # seed the -y_i/(B*temp) positive-pair term from the HOME image (fp32 accumulator),
-        # then stream images past home texts again -> complete dX locally, no gradient comm.
-        dX = y_img.float() * (-scale)
+        # seed the positive-pair term from the HOME image (fp32 accumulator), then stream
+        # images past home texts again -> complete dX locally, no gradient comm.
+        if seed is None:
+            dX = y_img.float() * (-scale)
+        else:
+            dX = y_img.float() * (seed * scale)[:, None]
         cur_y = y_img.contiguous().clone()
         for hop in range(world):
             reqs = None
             if hop + 1 < world:
                 recv_y, reqs = _ring_post(cur_y, send_to, recv_from, group)
-            _launch_grad(x_text, cur_y, sum_exp_row, scale, dX, ctx.inv_temperature)
+            _launch_grad(x_text, cur_y, div, scale, dX, ctx.inv_temperature)
             if reqs is not None:
                 for req in reqs:
                     req.wait()
                 cur_y = recv_y
         dX = dX * grad_output
-        return dX.to(ctx.in_dtype), None, None, None, None, None
+        return dX.to(ctx.in_dtype), None, None, None, None, None, None, None
 
 
 class DistributedMemoryEfficientLiTLoss(nn.Module):
@@ -218,12 +236,18 @@ class DistributedMemoryEfficientLiTLoss(nn.Module):
     stable=True rescales the gradient by sqrt(global_batch / temperature) instead of
     1 / temperature, keeping values out of fp32 underflow at very large batches; use
     lr / sqrt(global_batch * temperature) to mimic the default behaviour (see lit_loss.py).
+
+    tau_plus > 0 switches to the debiased contrastive loss (arXiv 2007.00224). The row
+    denominators are complete on their home rank, so debiasing adds no communication.
     """
-    def __init__(self, temperature=0.07, normalized_inputs=False, stable=False, group=None):
+    def __init__(self, temperature=0.07, normalized_inputs=False, stable=False,
+                 tau_plus=0.0, group=None):
         super().__init__()
+        _validate_tau_plus(tau_plus)
         self.temperature = temperature
         self.normalized_inputs = normalized_inputs
         self.stable = stable
+        self.tau_plus = tau_plus
         self.group = group
 
     def forward(self, text_features, image_features):
@@ -242,4 +266,5 @@ class DistributedMemoryEfficientLiTLoss(nn.Module):
 
         # image is locked -> detach so no gradient is tracked for it.
         return DistributedMemoryEfficientLiTLossNormed.apply(
-            x, y.detach(), inv_temperature, scale, batch_size, self.group)
+            x, y.detach(), inv_temperature, scale, self.tau_plus,
+            math.exp(-2.0 / self.temperature), batch_size, self.group)

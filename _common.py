@@ -2,8 +2,8 @@
 
 Holds everything that was previously copy-pasted across the loss modules: numeric
 constants, the per-architecture backward tile table, distributed helpers, and the
-masked embedding (Qwen3-style) kernel pair used by clip_embedding_loss.py and
-lit_embedding_loss.py (one kernel pair covers both: the gradient kernel takes a
+masked Qwen3-loss kernel pair used by clip_qwen3_loss.py and
+lit_qwen3_loss.py (one kernel pair covers both: the gradient kernel takes a
 TWO_SIDED flag for whether the column direction is emitted).
 """
 import os
@@ -54,6 +54,39 @@ def check_dims(d_model):
     return block_d
 
 
+def validate_tau_plus(tau_plus):
+    if not 0.0 <= tau_plus < 1.0:
+        raise ValueError(f"tau_plus must be in [0, 1), got {tau_plus}")
+
+
+def debias_denominators(pos_exp, sum_exp, num_negatives, tau_plus, floor):
+    """Debiased contrastive denominator (arXiv 2007.00224) as a per-row transform.
+
+    All inputs live in the kernels' shifted exp domain exp((s - 1)/t), so the paper's
+    clamp floor e^(-1/t) is passed as floor = e^(-2/t); the transform is homogeneous
+    in the shift, leaving the loss unchanged. The negative sum is replaced by
+    num_negatives * g with g = max((neg_mean - tau_plus * pos) / (1 - tau_plus), floor).
+    num_negatives is the nominal negative count: entries a false-negative mask dropped
+    still divide the mean (they contribute zero, they are not re-counted).
+
+    Returns (denom, divisor, seed): the corrected softmax denominator for the loss
+    value, the per-row divisor to hand the unchanged grad kernels in place of sum_exp
+    (inf on clamped rows, so their negatives get zero gradient), and the coefficient
+    of the eager positive-pair gradient seed (replaces the biased loss's plain -1;
+    the difference absorbs the kernel's wrong diagonal term). tau_plus = 0 recovers
+    the biased quantities exactly, up to fp32 rounding of the subtract/add round trip.
+    """
+    neg_mean = (sum_exp - pos_exp) / num_negatives
+    g = (neg_mean - tau_plus * pos_exp) / (1.0 - tau_plus)
+    clamped = g < floor
+    denom = pos_exp + num_negatives * g.clamp_min(floor)
+    ratio = pos_exp / denom
+    divisor = torch.where(clamped, torch.inf, (1.0 - tau_plus) * denom)
+    seed = torch.where(clamped, ratio - 1.0,
+                       -1.0 - ratio * (tau_plus * (num_negatives + 1) / (1.0 - tau_plus)))
+    return denom, divisor, seed
+
+
 def validate_features(x, y):
     if not (x.is_cuda and y.is_cuda):
         raise ValueError("features must be CUDA tensors")
@@ -80,6 +113,12 @@ def ring_post(tensor, send_to, recv_from, group):
     return recv, dist.batch_isend_irecv(ops)
 
 
+def qwen3_num_negatives(batch_size, h, use_qq, use_dd):
+    """Nominal per-row negative count for the debiased Qwen3 loss: the in-batch
+    documents plus each enabled extra group; masked entries are not re-counted."""
+    return (batch_size - 1) * (1 + use_qq + use_dd) + (h.shape[1] if h is not None else 0)
+
+
 def hard_negative_exp(q, h, pos, inv_temperature, margin):
     """Masked exp2 of the (batch, K) row-specific hard-negative similarities."""
     s_h = torch.einsum('bkd,bd->bk', h.float(), q.float())
@@ -88,7 +127,7 @@ def hard_negative_exp(q, h, pos, inv_temperature, margin):
 
 
 @triton.jit
-def emb_denom_kernel(
+def qwen3_denom_kernel(
     A_ptr, B_ptr, pos_ptr, sum_exp_row_ptr,
     n_i, n_j, inv_temperature, margin, row_offset, col_offset,
     EXCLUDE_DIAG: tl.constexpr,
@@ -125,7 +164,7 @@ def emb_denom_kernel(
 
 
 @triton.jit
-def emb_grad_kernel(
+def qwen3_grad_kernel(
     A_ptr, B_ptr, pos_ptr, sum_exp_row_ptr, dA_ptr, dB_ptr,
     n_i, n_j, inv_temperature, margin, grad_scale, row_offset, col_offset,
     EXCLUDE_DIAG: tl.constexpr, TWO_SIDED: tl.constexpr,
@@ -180,12 +219,12 @@ def emb_grad_kernel(
                           mask=(j_mask[:, None] & d_mask[None, :]), sem="relaxed")
 
 
-def launch_emb_denom(a, b, pos, sum_exp_row, inv_temperature, margin,
-                     exclude_diag=False, row_offset=0, col_offset=0):
+def launch_qwen3_denom(a, b, pos, sum_exp_row, inv_temperature, margin,
+                       exclude_diag=False, row_offset=0, col_offset=0):
     n_i, d_model = a.shape
     n_j = b.shape[0]
     grid = (triton.cdiv(n_i, 128), triton.cdiv(n_j, 128))
-    emb_denom_kernel[grid](
+    qwen3_denom_kernel[grid](
         a, b, pos, sum_exp_row, n_i, n_j, inv_temperature, margin,
         row_offset, col_offset, EXCLUDE_DIAG=exclude_diag,
         BLOCK_SIZE_I=128, BLOCK_SIZE_J=128, BLOCK_SIZE_D=check_dims(d_model),
@@ -193,13 +232,13 @@ def launch_emb_denom(a, b, pos, sum_exp_row, inv_temperature, margin,
     )
 
 
-def launch_emb_grad(a, b, pos, sum_exp_row, dA, dB, inv_temperature, margin, grad_scale,
-                    exclude_diag=False, row_offset=0, col_offset=0, *, two_sided):
+def launch_qwen3_grad(a, b, pos, sum_exp_row, dA, dB, inv_temperature, margin, grad_scale,
+                      exclude_diag=False, row_offset=0, col_offset=0, *, two_sided):
     n_i, d_model = a.shape
     n_j = b.shape[0]
     block_i, block_j, num_warps, num_stages = backward_blocks(a.device)
     grid = (triton.cdiv(n_i, block_i), triton.cdiv(n_j, block_j))
-    emb_grad_kernel[grid](
+    qwen3_grad_kernel[grid](
         a, b, pos, sum_exp_row, dA, dB, n_i, n_j, inv_temperature, margin, grad_scale,
         row_offset, col_offset, EXCLUDE_DIAG=exclude_diag, TWO_SIDED=two_sided,
         BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j, BLOCK_SIZE_D=check_dims(d_model),

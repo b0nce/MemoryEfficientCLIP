@@ -1,6 +1,6 @@
 # Memory Efficient CLIP and LiT Loss
 
-A memory-efficient implementation of CLIP (Contrastive Language-Image Pre-training) and LiT (Locked-image text Tuning) contrastive loss functions using the Triton compiler. This repository provides high-performance CUDA kernels that optimize the computation of contrastive loss functions for large batch sizes and embedding dimensions. Tested only on A100 80Gb.
+A memory-efficient implementation of CLIP (Contrastive Language-Image Pre-training) and LiT (Locked-image text Tuning) contrastive loss functions using the Triton compiler. This repository provides high-performance CUDA kernels that optimize the computation of contrastive loss functions for large batch sizes and embedding dimensions. Numerically validated on A100 (sm80), H100 (sm90), and B200 (sm100).
 
 ## Overview
 
@@ -19,7 +19,8 @@ This implementation offers significant memory savings compared to standard PyTor
 - Fully differentiable with optimized gradient computation
 - Handles large batch sizes that would cause OOM errors with naive implementations
 - Implementations for both CLIP (bidirectional) and LiT (unidirectional) loss functions
-- Qwen3-style embedding loss: query->document InfoNCE with false-negative masking, hard negatives, and optional q-q / d-d in-batch negatives, in a CLIP-style (both towers trained) and a LiT-style (locked document tower) variant
+- Qwen3 loss (the Qwen3-Embedding InfoNCE objective): query->document InfoNCE with false-negative masking, hard negatives, and optional q-q / d-d in-batch negatives, in a CLIP-style (both towers trained) and a LiT-style (locked document tower) variant
+- Debiased contrastive loss (arXiv 2007.00224) on every module via `tau_plus`, at no extra kernel cost
 
 ## Usage
 
@@ -75,15 +76,15 @@ image_features = torch.randn(batch_size, dim, device="cuda")
 loss = lit_loss(text_features, image_features)
 ```
 
-### Embedding Loss (Qwen3-style)
+### Qwen3 Loss
 
 ```python
 import torch
-from clip_embedding_loss import MemoryEfficientEmbeddingLoss
+from clip_qwen3_loss import MemoryEfficientQwen3Loss
 
 # Asymmetric query->document InfoNCE with a false-negative mask: any negative whose
 # similarity exceeds s(q_i, d_i) + margin is dropped as a presumed unlabeled positive.
-emb_loss = MemoryEfficientEmbeddingLoss(
+qwen3_loss = MemoryEfficientQwen3Loss(
     temperature=0.05,
     margin=0.1,
     use_qq_negatives=True,   # queries repel other queries      (optional)
@@ -96,7 +97,7 @@ doc_features = torch.randn(batch_size, dim, device="cuda")
 # Row-specific hard negatives: each query only competes against its own K.
 hard_negatives = torch.randn(batch_size, num_hard_negatives, dim, device="cuda")
 
-loss = emb_loss(query_features, doc_features, hard_negatives)  # hard_negatives optional
+loss = qwen3_loss(query_features, doc_features, hard_negatives)  # hard_negatives optional
 ```
 
 For a locked document tower (precomputed corpus embeddings, frozen doc encoder) use
@@ -104,15 +105,15 @@ the LiT-style variant. Only the queries receive gradients and there is no d-d op
 since with locked documents its repulsion gradient has nowhere to land:
 
 ```python
-from lit_embedding_loss import MemoryEfficientLiTEmbeddingLoss
+from lit_qwen3_loss import MemoryEfficientLiTQwen3Loss
 
-lit_emb_loss = MemoryEfficientLiTEmbeddingLoss(
+lit_qwen3_loss = MemoryEfficientLiTQwen3Loss(
     temperature=0.05, margin=0.1, use_qq_negatives=True)
-loss = lit_emb_loss(query_features, doc_features, hard_negatives)
+loss = lit_qwen3_loss(query_features, doc_features, hard_negatives)
 ```
 
 Both files also contain the corresponding DDP modules
-(`DistributedMemoryEfficientEmbeddingLoss`, `DistributedMemoryEfficientLiTEmbeddingLoss`).
+(`DistributedMemoryEfficientQwen3Loss`, `DistributedMemoryEfficientLiTQwen3Loss`).
 
 ### Distributed CLIP Loss (multi-GPU DDP)
 
@@ -167,17 +168,17 @@ global_loss = partial_loss.detach().clone()
 dist.all_reduce(global_loss)
 ```
 
-### Distributed Embedding Loss (multi-GPU DDP)
+### Distributed Qwen3 Loss (multi-GPU DDP)
 
 ```python
 import torch
 import torch.distributed as dist
-from clip_embedding_loss import DistributedMemoryEfficientEmbeddingLoss
+from clip_qwen3_loss import DistributedMemoryEfficientQwen3Loss
 
 dist.init_process_group("nccl")
 torch.cuda.set_device(dist.get_rank())
 
-emb_loss = DistributedMemoryEfficientEmbeddingLoss(
+qwen3_loss = DistributedMemoryEfficientQwen3Loss(
     temperature=0.05, margin=0.1, use_qq_negatives=True, use_dd_negatives=True)
 
 # Each rank passes ONLY its shard; hard negatives stay on their query's rank.
@@ -186,24 +187,40 @@ query_features = torch.randn(local_batch, dim, device="cuda", requires_grad=True
 doc_features = torch.randn(local_batch, dim, device="cuda", requires_grad=True)
 hard_negatives = torch.randn(local_batch, K, dim, device="cuda", requires_grad=True)
 
-partial_loss = emb_loss(query_features, doc_features, hard_negatives)
+partial_loss = qwen3_loss(query_features, doc_features, hard_negatives)
 partial_loss.backward()
 
 global_loss = partial_loss.detach().clone()
 dist.all_reduce(global_loss)
 ```
 
-All modules (single-GPU and distributed) accept `normalized_inputs=True` (skip the internal L2 normalize) and `stable=True` (the large-batch gradient rescaling described below), and take fp32, fp16, or bf16 features.
+All modules (single-GPU and distributed) accept `normalized_inputs=True` (skip the internal L2 normalize), `stable=True` (the large-batch gradient rescaling described below), and `tau_plus` (the debiased contrastive loss described below), and take fp32, fp16, or bf16 features.
 
 ### Stable gradient rescaling
 
 `stable=True` rescales the gradient by `sqrt(batch / temperature)` instead of `1 / temperature`: the default `1 / (batch * temperature)` factor can nullify small values even in fp32, which matters at large batch sizes (300k+ works fine in practice). The loss value is unchanged, only the gradient scale differs, so the learning rate becomes batch-size dependent — use `lr / sqrt(batch * temperature)` to mimic the default behaviour, though at large batches standard values like 1e-4 tend to work well without that correction. The old `StableMemoryEfficientCLIPLoss` / `StableMemoryEfficientLiTLoss` classes remain as deprecated aliases for `stable=True`.
 
+### Debiased contrastive loss
+
+Every module accepts `tau_plus` (default 0 = the standard loss). `tau_plus > 0` switches to the debiased contrastive objective of [Chuang et al., 2020](https://arxiv.org/abs/2007.00224): with probability `tau_plus` an in-batch "negative" is actually an unlabeled positive, so each softmax denominator's negative sum `sum_neg` is replaced by `N * g` with
+
+```
+g = max((sum_neg / N - tau_plus * pos) / (1 - tau_plus), e^(-1/temperature))
+```
+
+where `N` is the negative count and `pos` the positive exponential (the paper's estimator with M = 1). The clamp keeps the estimate at its theoretical minimum; rows where it fires push no gradient into their negatives.
+
+```python
+clip_loss = MemoryEfficientCLIPLoss(temperature=0.07, tau_plus=0.1)
+```
+
+`tau_plus` composes with `stable` and, on the Qwen3 losses, with the false-negative mask (masked entries contribute zero to the negative mean but keep their slot in the nominal count `N`). See the implementation notes below for why this costs no new kernels.
+
 ## Requirements
 
 - PyTorch >= 2.0 (the distributed modules use `dist.reduce_scatter_tensor` and `dist.batch_isend_irecv`)
 - Triton >= 3.0 (the kernels use `tl.dot(..., input_precision=...)`)
-- CUDA-capable GPU. Backward tile sizes are tuned for A100 / H100 / B200; other architectures fall back to a safe default. Numerically validated on A100 80GB.
+- CUDA-capable GPU. Backward tile sizes are tuned for A100 / H100 / B200; other architectures fall back to a safe default. Numerically validated on A100 (sm80), H100 (sm90), and B200 (sm100).
 
 ## Performance
 
@@ -213,7 +230,7 @@ This implementation is designed for large batch sizes and embedding dimensions w
 
 ### Code layout
 
-Shared constants, distributed helpers, and the masked embedding kernel pair live in `_common.py`. The single-GPU CLIP and LiT losses (`clip_loss.py`, `lit_loss.py`) reuse the kernels of their distributed counterparts with the whole batch as one block, so there is exactly one implementation of each kernel.
+Shared constants, distributed helpers, and the masked Qwen3-loss kernel pair live in `_common.py`. The single-GPU CLIP and LiT losses (`clip_loss.py`, `lit_loss.py`) reuse the kernels of their distributed counterparts with the whole batch as one block, so there is exactly one implementation of each kernel.
 
 ### CLIP Loss
 
@@ -251,9 +268,9 @@ Note on memory: the backward needs every column against the home rows, so the as
 
 The image features stream past the home texts twice, once to complete the row denominators and once for the gradient. As with the distributed CLIP loss, `forward` returns the local partial loss and `backward` fills the local shard's text gradient, with fp32 accumulation for fp16/bf16 inputs.
 
-### Embedding Loss (Qwen3-style)
+### Qwen3 Loss
 
-`clip_embedding_loss.py` implements the improved InfoNCE objective of the Qwen3
+`clip_qwen3_loss.py` implements the improved InfoNCE objective of the Qwen3
 Embedding report: a row-only (query -> document) softmax whose denominator adds, per
 query, the positive, the in-batch documents, K row-specific hard negatives, and
 optionally query-query and document-document in-batch negatives. Every negative is
@@ -264,9 +281,9 @@ Because the softmax is row-only, each negative group is just another additive
 contribution to the same per-row fp32 denominator vector, so one pair of kernels
 covers everything:
 
-1. `emb_denom_kernel`: a masked rectangular sum-exp block pass with an optional global
+1. `qwen3_denom_kernel`: a masked rectangular sum-exp block pass with an optional global
    diagonal exclusion, launched once per enabled group ((Q, D), (Q, Q), (D, D)).
-2. `emb_grad_kernel`: recomputes a masked block and emits both gradient directions
+2. `qwen3_grad_kernel`: recomputes a masked block and emits both gradient directions
    (`dA += p @ B`, `dB += p^T @ A`) in a single pass; for the q-q / d-d passes both
    outputs point at the same buffer. The mask recomputes identically to the forward,
    so no B x B state is ever stored.
@@ -285,12 +302,41 @@ tower iff q-q is enabled) is kept for the backward, so peak memory is
 O(global_batch x dim) per rank. As elsewhere, `forward` returns the local partial loss and `backward`
 fills the shard's gradients, with fp32 accumulation for fp16/bf16 inputs.
 
-`lit_embedding_loss.py` is the locked-document variant. Documents and hard negatives
+`lit_qwen3_loss.py` is the locked-document variant. Documents and hard negatives
 receive no gradient, the q-d backward pass emits only the query direction, and the
 d-d option is dropped (with locked documents its repulsion gradient has nowhere to
 land, it would only inflate the denominator). In the DDP module this removes all
 gradient communication; enabling q-q negatives adds back one reduce-scatter for the
 query columns.
+
+### Debiased contrastive loss
+
+Debiasing (`tau_plus > 0`) reuses every kernel untouched, because the debiased
+denominator is a per-row transform of exactly the quantities the kernels already
+produce. In the kernels' shifted exp domain (all exponentials carry a fixed
+`e^(-1/t)` factor, which cancels in the loss) the forward computes, per row,
+`D = pos + N * max((sum_neg/N - tau_plus * pos)/(1 - tau_plus), e^(-2/t))` from the
+accumulated sum-exp vector and the O(batch) diagonal — the paper's floor `e^(-1/t)`
+lands at `e^(-2/t)` after the shift. The loss then just logs `D` instead of the raw
+sum.
+
+The backward exploits the fact that the grad kernels divide each recomputed
+exponential by a per-row divisor they load from a vector: the debiased gradient of
+every off-diagonal pair is `exp / ((1 - tau_plus) * D)`, so that product is passed
+in place of the sum-exp vector (`+inf` on clamped rows, whose negatives get zero
+gradient, matching the clamp's zero derivative). The diagonal term the kernel then
+gets wrong is absorbed into the eager positive-pair seed, whose coefficient becomes
+a per-row value instead of the plain `-1`; `tau_plus = 0` reduces to `-1` and the
+standard loss exactly. Everything outside the kernels is O(batch) eager fp32 math
+(`debias_denominators` in `_common.py`).
+
+Distributed: the CLIP column transform needs every column's positive exponential,
+one O(batch) all-gather next to the existing column-denominator all-reduce. The
+row-only losses (LiT and both Qwen3 variants) debias entirely on the row's home
+rank with no extra communication. In the Qwen3 losses the false-negative mask
+composes with debiasing: masked entries contribute zero to the negative mean but
+keep their slot in the nominal negative count
+`N = (B-1) * (1 + qq + dd) + K`.
 
 ## Tests
 
@@ -298,11 +344,13 @@ Both test scripts compare losses and all gradients against dense autograd refere
 (they need a CUDA GPU):
 
 - `test_clip_lit_loss.py`: the CLIP and LiT losses, single-GPU and distributed,
-  including the `stable=True` rescaling and the deprecated `Stable*` aliases.
-- `test_embedding_loss.py`: the embedding losses, single-GPU and distributed.
+  including the `stable=True` rescaling, the deprecated `Stable*` aliases, and the
+  debiased (`tau_plus > 0`) variants with clamp-firing rows.
+- `test_qwen3_loss.py`: the Qwen3 losses, single-GPU and distributed, including
+  the debiased variants.
 
 Run `python <script>.py` on one GPU, or `torchrun --nproc-per-node=N <script>.py`
-for the distributed versions. `bench_embedding_loss.py` reports timings and peak
+for the distributed versions. `bench_qwen3_loss.py` reports timings and peak
 memory and exports torch.profiler traces to `./traces/`.
 
 ## Differences between CLIP and LiT

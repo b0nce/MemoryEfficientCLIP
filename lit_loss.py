@@ -14,39 +14,55 @@ import torch.nn.functional as F
 
 try:
     from ._common import (LN2 as _LN2, LOG2E as _LOG2E,
-                          validate_features as _validate_features)
+                          debias_denominators as _debias_denominators,
+                          validate_features as _validate_features,
+                          validate_tau_plus as _validate_tau_plus)
     from .distributed_lit_loss import _launch_denom, _launch_grad
 except ImportError:   # running as a flat module from inside the repo
     from _common import (LN2 as _LN2, LOG2E as _LOG2E,
-                         validate_features as _validate_features)
+                         debias_denominators as _debias_denominators,
+                         validate_features as _validate_features,
+                         validate_tau_plus as _validate_tau_plus)
     from distributed_lit_loss import _launch_denom, _launch_grad
 
 
 class MemoryEfficientLiTLossNormed(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_text, y_img, inv_temperature, scale):
+    def forward(ctx, x_text, y_img, inv_temperature, scale, tau_plus, floor):
         batch_size = x_text.shape[0]
         sum_exp_row = torch.zeros(batch_size, device=x_text.device, dtype=torch.float32)
         _launch_denom(x_text, y_img, sum_exp_row, inv_temperature)
 
-        ctx.save_for_backward(x_text, y_img, sum_exp_row)
+        # the log2-domain diagonal, reused for the loss (log(exp2(s)) = ln2 * s) so no
+        # exponential is materialized just to be logged, and for the debiased transform.
+        sv = (x_text.float() * y_img.float()).sum(dim=1) * inv_temperature - inv_temperature
+        denom, div, seed = sum_exp_row, sum_exp_row, None
+        if tau_plus:
+            denom, div, seed = _debias_denominators(
+                torch.exp2(sv), sum_exp_row, batch_size - 1, tau_plus, floor)
+
+        saved = (x_text, y_img, div) + (() if seed is None else (seed,))
+        ctx.save_for_backward(*saved)
+        ctx.debiased = seed is not None
         ctx.inv_temperature = inv_temperature
         ctx.scale = scale
         ctx.in_dtype = x_text.dtype
-
-        # loss over the diagonal, formed directly from the log2-domain logit
-        # (log(exp2(s)) = ln2 * s) so no exponential is materialized just to be logged.
-        sv = (x_text.float() * y_img.float()).sum(dim=1) * inv_temperature - inv_temperature
-        return -(sv * _LN2 - torch.log(sum_exp_row)).mean()
+        return -(sv * _LN2 - torch.log(denom)).mean()
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_text, y_img, sum_exp_row = ctx.saved_tensors
-        # seed with the -y_i positive-pair term, the kernel adds the p-weighted sums.
-        dX = y_img.float() * (-ctx.scale)
-        _launch_grad(x_text, y_img, sum_exp_row, ctx.scale, dX, ctx.inv_temperature)
+        if ctx.debiased:
+            x_text, y_img, div, seed = ctx.saved_tensors
+        else:
+            (x_text, y_img, div), seed = ctx.saved_tensors, None
+        # seed with the positive-pair term, the kernel adds the p-weighted sums.
+        if seed is None:
+            dX = y_img.float() * (-ctx.scale)
+        else:
+            dX = y_img.float() * (seed * ctx.scale)[:, None]
+        _launch_grad(x_text, y_img, div, ctx.scale, dX, ctx.inv_temperature)
         dX = dX * grad_output
-        return dX.to(ctx.in_dtype), None, None, None
+        return dX.to(ctx.in_dtype), None, None, None, None, None
 
 
 class MemoryEfficientLiTLoss(nn.Module):
@@ -59,12 +75,19 @@ class MemoryEfficientLiTLoss(nn.Module):
     rate becomes batch-size dependent -- use lr / sqrt(batch * temperature) to
     mimic the default behaviour, though at large batches standard values like
     1e-4 tend to work well without that correction.
+
+    tau_plus > 0 switches to the debiased contrastive loss (arXiv 2007.00224): the
+    negative sum in the row softmax denominator is replaced by its debiased estimate
+    under a class prior of tau_plus. tau_plus = 0 is the standard loss.
     """
-    def __init__(self, temperature=0.07, normalized_inputs=False, stable=False):
+    def __init__(self, temperature=0.07, normalized_inputs=False, stable=False,
+                 tau_plus=0.0):
         super().__init__()
+        _validate_tau_plus(tau_plus)
         self.temperature = temperature
         self.normalized_inputs = normalized_inputs
         self.stable = stable
+        self.tau_plus = tau_plus
 
     def forward(self, text_features, image_features):
         x = text_features if self.normalized_inputs else F.normalize(text_features, dim=1)
@@ -78,7 +101,8 @@ class MemoryEfficientLiTLoss(nn.Module):
                                 if self.stable else 1.0 / self.temperature)
         # image is locked -> detach so no gradient is tracked for it.
         return MemoryEfficientLiTLossNormed.apply(
-            x, y.detach(), inv_temperature, inv_temperature_orig / batch_size)
+            x, y.detach(), inv_temperature, inv_temperature_orig / batch_size,
+            self.tau_plus, math.exp(-2.0 / self.temperature))
 
 
 class StableMemoryEfficientLiTLoss(MemoryEfficientLiTLoss):

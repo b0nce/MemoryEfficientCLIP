@@ -27,7 +27,9 @@ try:
         LN2 as _LN2,
         backward_blocks as _backward_blocks,
         check_dims as _check_dims,
+        debias_denominators as _debias_denominators,
         validate_features as _validate_features,
+        validate_tau_plus as _validate_tau_plus,
         world_and_rank as _world_and_rank,
     )
 except ImportError:   # running as a flat module from inside the repo
@@ -36,7 +38,9 @@ except ImportError:   # running as a flat module from inside the repo
         LN2 as _LN2,
         backward_blocks as _backward_blocks,
         check_dims as _check_dims,
+        debias_denominators as _debias_denominators,
         validate_features as _validate_features,
+        validate_tau_plus as _validate_tau_plus,
         world_and_rank as _world_and_rank,
     )
 
@@ -191,27 +195,35 @@ def _assemble_ring(x_local, y_local, inv_temperature, group):
     return y_full, sum_exp_row, sum_exp_col
 
 
-def _partial_loss(x_local, y_local, sum_exp_row, sum_exp_col_home, inv_temperature, batch_size):
+def _partial_loss(x_local, y_local, denom_row, denom_col_home, inv_temperature, batch_size):
     """This rank's additive contribution to the mean symmetric loss over its rows. The
     logits are formed directly from the log2-domain diagonal (log(exp2(s)) = ln2 * s), so
-    no exponential is materialized just to be logged."""
+    no exponential is materialized just to be logged. The denominators are the plain
+    sum-exp vectors, or their debiased transform when tau_plus > 0."""
     sv = (x_local.float() * y_local.float()).sum(dim=1) * inv_temperature - inv_temperature
-    logits = (sv * _LN2 - torch.log(sum_exp_row)) + (sv * _LN2 - torch.log(sum_exp_col_home))
+    logits = (sv * _LN2 - torch.log(denom_row)) + (sv * _LN2 - torch.log(denom_col_home))
     return -logits.sum() / (2.0 * batch_size)
 
 
-def _ring_backward(x_local, y_full, sum_exp_row, sum_exp_col, offset, n,
-                   inv_temperature, inv_temperature_orig, batch_size):
+def _ring_backward(x_local, y_full, div_row, div_col, offset, n,
+                   inv_temperature, inv_temperature_orig, batch_size, seed=None):
     """dX for the local rows (final) and dY_partial for all columns (this rank's part).
-    dX is seeded with its -y_i/(batch*temp) positive-pair term; dY gets its -x_i term
-    after the caller reduce-scatters dY_partial to the owning shard. Buffers are fp32."""
+    The divisors are the sum-exp vectors, or the debiased divisors when tau_plus > 0.
+    dX is seeded with its positive-pair term: -y_i/(batch*temp) for the biased loss, or
+    seed_i * y_i * temp_orig/(2*batch) for the debiased one (seed sums the row and
+    column diagonal coefficients). dY gets its matching -x_i / seed_i * x_i term after
+    the caller reduce-scatters dY_partial to the owning shard. Buffers are fp32."""
     device, d_model = x_local.device, x_local.shape[1]
-    dX = y_full.narrow(0, offset, n).float() * (-inv_temperature_orig / batch_size)
+    y_home = y_full.narrow(0, offset, n).float()
+    if seed is None:
+        dX = y_home * (-inv_temperature_orig / batch_size)
+    else:
+        dX = y_home * (seed * (inv_temperature_orig / (2.0 * batch_size)))[:, None]
     dY_partial = torch.zeros(batch_size, d_model, device=device, dtype=torch.float32)
     block_i, block_j, num_warps, num_stages = _backward_blocks(device)
     grid = (triton.cdiv(n, block_i), triton.cdiv(batch_size, block_j))
     clip_grad_both_kernel[grid](
-        x_local, y_full, sum_exp_row, sum_exp_col, dX, dY_partial,
+        x_local, y_full, div_row, div_col, dX, dY_partial,
         inv_temperature, inv_temperature_orig, n, batch_size,
         BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j, BLOCK_SIZE_D=_check_dims(d_model),
         D_MODEL=d_model, INPUT_PRECISION=INPUT_PRECISION,
@@ -222,23 +234,29 @@ def _ring_backward(x_local, y_full, sum_exp_row, sum_exp_col, offset, n,
 
 class DistributedMemoryEfficientCLIPLossNormed(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x_local, y_local, y_full, sum_exp_row, sum_exp_col,
-                offset, n, inv_temperature, inv_temperature_orig, batch_size, group):
-        ctx.save_for_backward(x_local, y_full, sum_exp_row, sum_exp_col)
+    def forward(ctx, x_local, y_local, y_full, denom_row, denom_col, div_row, div_col,
+                seed, offset, n, inv_temperature, inv_temperature_orig, batch_size, group):
+        saved = (x_local, y_full, div_row, div_col) + (() if seed is None else (seed,))
+        ctx.save_for_backward(*saved)
+        ctx.debiased = seed is not None
         ctx.offset, ctx.n, ctx.group = offset, n, group
         ctx.inv_temperature, ctx.inv_temperature_orig = inv_temperature, inv_temperature_orig
         ctx.batch_size, ctx.in_dtype = batch_size, x_local.dtype
         # x_local / y_local carry the grad path only; the value uses the assembled tower.
-        return _partial_loss(x_local, y_local, sum_exp_row,
-                             sum_exp_col[offset:offset + n], inv_temperature, batch_size)
+        return _partial_loss(x_local, y_local, denom_row,
+                             denom_col[offset:offset + n], inv_temperature, batch_size)
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_local, y_full, sum_exp_row, sum_exp_col = ctx.saved_tensors
+        if ctx.debiased:
+            x_local, y_full, div_row, div_col, seed = ctx.saved_tensors
+        else:
+            (x_local, y_full, div_row, div_col), seed = ctx.saved_tensors, None
         offset, n, batch_size = ctx.offset, ctx.n, ctx.batch_size
         inv_temperature_orig = ctx.inv_temperature_orig
-        dX, dY_partial = _ring_backward(x_local, y_full, sum_exp_row, sum_exp_col, offset, n,
-                                        ctx.inv_temperature, inv_temperature_orig, batch_size)
+        dX, dY_partial = _ring_backward(x_local, y_full, div_row, div_col, offset, n,
+                                        ctx.inv_temperature, inv_temperature_orig,
+                                        batch_size, seed)
         world, _ = _world_and_rank(ctx.group)
         if world > 1:
             # reduce-scatter delivers exactly this rank's summed column shard at half the
@@ -247,10 +265,14 @@ class DistributedMemoryEfficientCLIPLossNormed(torch.autograd.Function):
             dist.reduce_scatter_tensor(dY, dY_partial, group=ctx.group)
         else:
             dY = dY_partial
-        dY = dY - x_local.float() * (inv_temperature_orig / batch_size)   # -x_i/(batch*temp) term
+        if seed is None:
+            dY = dY - x_local.float() * (inv_temperature_orig / batch_size)   # -x_i/(batch*temp)
+        else:
+            dY = dY + x_local.float() * (seed * (inv_temperature_orig
+                                                 / (2.0 * batch_size)))[:, None]
         dX, dY = dX * grad_output, dY * grad_output
         return (dX.to(ctx.in_dtype), dY.to(ctx.in_dtype),
-                None, None, None, None, None, None, None, None, None)
+                None, None, None, None, None, None, None, None, None, None, None, None)
 
 
 class DistributedMemoryEfficientCLIPLoss(nn.Module):
@@ -261,12 +283,20 @@ class DistributedMemoryEfficientCLIPLoss(nn.Module):
     stable=True rescales the gradient by sqrt(global_batch / temperature) instead of
     1 / temperature, which keeps values out of fp32 underflow at very large batches;
     use lr / sqrt(global_batch * temperature) to mimic the default behaviour.
+
+    tau_plus > 0 switches to the debiased contrastive loss (arXiv 2007.00224): the
+    negative sum in each softmax denominator is replaced by its debiased estimate
+    under a class prior of tau_plus. Adds one O(batch) all-gather of the positive
+    exponentials; the kernels are unchanged.
     """
-    def __init__(self, temperature=0.07, normalized_inputs=False, stable=False, group=None):
+    def __init__(self, temperature=0.07, normalized_inputs=False, stable=False,
+                 tau_plus=0.0, group=None):
         super().__init__()
+        _validate_tau_plus(tau_plus)
         self.temperature = temperature
         self.normalized_inputs = normalized_inputs
         self.stable = stable
+        self.tau_plus = tau_plus
         self.group = group
 
     def forward(self, image_features, text_features):
@@ -285,6 +315,22 @@ class DistributedMemoryEfficientCLIPLoss(nn.Module):
         y_full, sum_exp_row, sum_exp_col = _assemble_ring(
             x.detach(), y.detach(), inv_temperature, self.group)
         offset = rank * local_batch
+        denom_row, denom_col = sum_exp_row, sum_exp_col
+        div_row, div_col, seed = sum_exp_row, sum_exp_col, None
+        if self.tau_plus:
+            pos_exp = torch.exp2((x.detach().float() * y.detach().float()).sum(dim=1)
+                                 * inv_temperature - inv_temperature)
+            if world > 1:   # the column transform needs every column's positive
+                pos_full = torch.empty(batch_size, device=x.device, dtype=torch.float32)
+                dist.all_gather_into_tensor(pos_full, pos_exp, group=self.group)
+            else:
+                pos_full = pos_exp
+            floor = math.exp(-2.0 / self.temperature)
+            denom_row, div_row, seed_row = _debias_denominators(
+                pos_exp, sum_exp_row, batch_size - 1, self.tau_plus, floor)
+            denom_col, div_col, seed_col = _debias_denominators(
+                pos_full, sum_exp_col, batch_size - 1, self.tau_plus, floor)
+            seed = seed_row + seed_col[offset:offset + local_batch]
         return DistributedMemoryEfficientCLIPLossNormed.apply(
-            x, y, y_full, sum_exp_row, sum_exp_col,
+            x, y, y_full, denom_row, denom_col, div_row, div_col, seed,
             offset, local_batch, inv_temperature, inv_temperature_orig, batch_size, self.group)

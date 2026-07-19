@@ -1,7 +1,8 @@
-"""Qwen3-style embedding loss, LiT-style: the document tower is locked.
+"""Qwen3 loss (the Qwen3-Embedding InfoNCE objective), LiT-style: the document
+tower is locked.
 
 Same query->document InfoNCE with false-negative masking, hard negatives and
-optional q-q negatives as clip_embedding_loss.py, but documents and hard negatives
+optional q-q negatives as clip_qwen3_loss.py, but documents and hard negatives
 receive no gradient. There is no d-d option: with locked documents its repulsion
 gradient has nowhere to land, it only inflates the denominator. The backward emits
 dQ only, so the DDP version needs no gradient communication unless q-q is enabled.
@@ -17,29 +18,36 @@ try:
     from ._common import (
         LN2 as _LN2,
         LOG2E as _LOG2E,
+        debias_denominators as _debias_denominators,
         hard_negative_exp as _hard_negative_exp,
-        launch_emb_denom as _launch_denom,
-        launch_emb_grad as _launch_grad,
+        launch_qwen3_denom as _launch_denom,
+        launch_qwen3_grad as _launch_grad,
+        qwen3_num_negatives as _num_negatives,
         validate_features as _validate_features,
         validate_hard_negatives as _validate_hard_negatives,
+        validate_tau_plus as _validate_tau_plus,
         world_and_rank as _world_and_rank,
     )
 except ImportError:   # running as a flat module from inside the repo
     from _common import (
         LN2 as _LN2,
         LOG2E as _LOG2E,
+        debias_denominators as _debias_denominators,
         hard_negative_exp as _hard_negative_exp,
-        launch_emb_denom as _launch_denom,
-        launch_emb_grad as _launch_grad,
+        launch_qwen3_denom as _launch_denom,
+        launch_qwen3_grad as _launch_grad,
+        qwen3_num_negatives as _num_negatives,
         validate_features as _validate_features,
         validate_hard_negatives as _validate_hard_negatives,
+        validate_tau_plus as _validate_tau_plus,
         world_and_rank as _world_and_rank,
     )
 
 
-class MemoryEfficientLiTEmbeddingLossNormed(torch.autograd.Function):
+class MemoryEfficientLiTQwen3LossNormed(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, d, h, inv_temperature, inv_temperature_orig, margin, use_qq):
+    def forward(ctx, q, d, h, inv_temperature, inv_temperature_orig, margin, use_qq,
+                tau_plus, floor):
         batch_size, d_model = q.shape
         pos = (q.float() * d.float()).sum(dim=1)
 
@@ -50,8 +58,17 @@ class MemoryEfficientLiTEmbeddingLossNormed(torch.autograd.Function):
         if h is not None:
             sum_exp_row += _hard_negative_exp(q, h, pos, inv_temperature, margin).sum(dim=1)
 
-        saved = (q, d, pos, sum_exp_row) + ((h,) if h is not None else ())
+        sv = pos * inv_temperature - inv_temperature
+        denom, div, seed = sum_exp_row, sum_exp_row, None
+        if tau_plus:
+            denom, div, seed = _debias_denominators(
+                torch.exp2(sv), sum_exp_row,
+                _num_negatives(batch_size, h, use_qq, False), tau_plus, floor)
+
+        saved = ((q, d, pos, div) + (() if seed is None else (seed,))
+                 + ((h,) if h is not None else ()))
         ctx.save_for_backward(*saved)
+        ctx.debiased = seed is not None
         ctx.has_h = h is not None
         ctx.inv_temperature = inv_temperature
         ctx.inv_temperature_orig = inv_temperature_orig
@@ -59,49 +76,51 @@ class MemoryEfficientLiTEmbeddingLossNormed(torch.autograd.Function):
         ctx.use_qq = use_qq
         ctx.batch_size = batch_size
         ctx.in_dtype = q.dtype
-
-        sv = pos * inv_temperature - inv_temperature
-        return -(sv * _LN2 - torch.log(sum_exp_row)).mean()
+        return -(sv * _LN2 - torch.log(denom)).mean()
 
     @staticmethod
     def backward(ctx, grad_output):
-        if ctx.has_h:
-            q, d, pos, sum_exp_row, h = ctx.saved_tensors
-        else:
-            (q, d, pos, sum_exp_row), h = ctx.saved_tensors, None
+        tensors = list(ctx.saved_tensors)
+        q, d, pos, div = tensors[:4]
+        seed = tensors[4] if ctx.debiased else None
+        h = tensors[-1] if ctx.has_h else None
         inv_temperature, margin = ctx.inv_temperature, ctx.margin
         grad_scale = ctx.inv_temperature_orig / ctx.batch_size
 
-        dQ = d.float() * (-grad_scale)
-        _launch_grad(q, d, pos, sum_exp_row, dQ, dQ, inv_temperature, margin, grad_scale,
+        coeff = -grad_scale if seed is None else (seed * grad_scale)[:, None]
+        dQ = d.float() * coeff
+        _launch_grad(q, d, pos, div, dQ, dQ, inv_temperature, margin, grad_scale,
                      two_sided=False)
         if ctx.use_qq:
-            _launch_grad(q, q, pos, sum_exp_row, dQ, dQ, inv_temperature, margin, grad_scale,
+            _launch_grad(q, q, pos, div, dQ, dQ, inv_temperature, margin, grad_scale,
                          exclude_diag=True, two_sided=True)
         if h is not None:
-            p_h = _hard_negative_exp(q, h, pos, inv_temperature, margin) / sum_exp_row[:, None]
+            p_h = _hard_negative_exp(q, h, pos, inv_temperature, margin) / div[:, None]
             dQ += grad_scale * torch.einsum('bk,bkd->bd', p_h, h.float())
 
         dQ = dQ * grad_output
-        return dQ.to(ctx.in_dtype), None, None, None, None, None, None
+        return dQ.to(ctx.in_dtype), None, None, None, None, None, None, None, None
 
 
-class MemoryEfficientLiTEmbeddingLoss(nn.Module):
+class MemoryEfficientLiTQwen3Loss(nn.Module):
     """forward(query_features, doc_features, hard_negative_features=None).
 
     Documents and hard negatives are treated as locked and receive no gradient.
     Hard negatives have shape (batch, K, dim). margin >= 2 disables the mask.
-    stable=True rescales the gradient by sqrt(batch / temperature), see
-    clip_embedding_loss.py.
+    stable=True rescales the gradient by sqrt(batch / temperature), and tau_plus > 0
+    switches to the debiased contrastive loss (arXiv 2007.00224); see
+    clip_qwen3_loss.py for both.
     """
     def __init__(self, temperature=0.07, margin=0.1, use_qq_negatives=False,
-                 normalized_inputs=False, stable=False):
+                 normalized_inputs=False, stable=False, tau_plus=0.0):
         super().__init__()
+        _validate_tau_plus(tau_plus)
         self.temperature = temperature
         self.margin = margin
         self.use_qq_negatives = use_qq_negatives
         self.normalized_inputs = normalized_inputs
         self.stable = stable
+        self.tau_plus = tau_plus
 
     def forward(self, query_features, doc_features, hard_negative_features=None):
         q, d, h = query_features, doc_features, hard_negative_features
@@ -120,9 +139,9 @@ class MemoryEfficientLiTEmbeddingLoss(nn.Module):
         inv_temperature = _LOG2E / self.temperature
         inv_temperature_orig = (math.sqrt(batch_size / self.temperature)
                                 if self.stable else 1.0 / self.temperature)
-        return MemoryEfficientLiTEmbeddingLossNormed.apply(
+        return MemoryEfficientLiTQwen3LossNormed.apply(
             q, d, h, inv_temperature, inv_temperature_orig, self.margin,
-            self.use_qq_negatives)
+            self.use_qq_negatives, self.tau_plus, math.exp(-2.0 / self.temperature))
 
 
 def _assemble_ring(q_local, d_local, pos, inv_temperature, margin, use_qq, group):
@@ -177,32 +196,45 @@ def _assemble_ring(q_local, d_local, pos, inv_temperature, margin, use_qq, group
     return d_full, q_full, sum_exp_row
 
 
-class DistributedMemoryEfficientLiTEmbeddingLossNormed(torch.autograd.Function):
+class DistributedMemoryEfficientLiTQwen3LossNormed(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q_local, d_local, h_local, d_full, q_full, pos, sum_exp_row,
                 offset, n, inv_temperature, inv_temperature_orig, margin,
-                use_qq, batch_size, group):
+                use_qq, tau_plus, floor, batch_size, group):
         if h_local is not None:
             sum_exp_row += _hard_negative_exp(
                 q_local, h_local, pos, inv_temperature, margin).sum(dim=1)
 
-        saved = ((q_local, d_local, d_full, pos, sum_exp_row)
+        # the row denominators are complete on their home rank, so the debiased
+        # transform needs no communication.
+        sv = pos * inv_temperature - inv_temperature
+        denom, div, seed = sum_exp_row, sum_exp_row, None
+        if tau_plus:
+            denom, div, seed = _debias_denominators(
+                torch.exp2(sv), sum_exp_row,
+                _num_negatives(batch_size, h_local, use_qq, False), tau_plus, floor)
+
+        saved = ((q_local, d_local, d_full, pos, div)
+                 + (() if seed is None else (seed,))
                  + ((q_full,) if use_qq else ()) + ((h_local,) if h_local is not None else ()))
         ctx.save_for_backward(*saved)
+        ctx.debiased = seed is not None
         ctx.has_h = h_local is not None
         ctx.offset, ctx.n, ctx.group = offset, n, group
         ctx.inv_temperature, ctx.inv_temperature_orig = inv_temperature, inv_temperature_orig
         ctx.margin, ctx.use_qq = margin, use_qq
         ctx.batch_size, ctx.in_dtype = batch_size, q_local.dtype
-
-        sv = pos * inv_temperature - inv_temperature
-        return -(sv * _LN2 - torch.log(sum_exp_row)).sum() / batch_size
+        return -(sv * _LN2 - torch.log(denom)).sum() / batch_size
 
     @staticmethod
     def backward(ctx, grad_output):
         tensors = list(ctx.saved_tensors)
-        q_local, d_local, d_full, pos, sum_exp_row = tensors[:5]
-        q_full = tensors[5] if ctx.use_qq else None
+        q_local, d_local, d_full, pos, div = tensors[:5]
+        idx = 5
+        seed = None
+        if ctx.debiased:
+            seed, idx = tensors[idx], idx + 1
+        q_full = tensors[idx] if ctx.use_qq else None
         h_local = tensors[-1] if ctx.has_h else None
         offset, n, batch_size = ctx.offset, ctx.n, ctx.batch_size
         inv_temperature, margin = ctx.inv_temperature, ctx.margin
@@ -210,12 +242,15 @@ class DistributedMemoryEfficientLiTEmbeddingLossNormed(torch.autograd.Function):
         device, d_model = q_local.device, q_local.shape[1]
         world, _ = _world_and_rank(ctx.group)
 
-        dQ = d_local.float() * (-grad_scale)
-        _launch_grad(q_local, d_full, pos, sum_exp_row, dQ, dQ,
+        if seed is None:
+            dQ = d_local.float() * (-grad_scale)
+        else:
+            dQ = d_local.float() * (seed * grad_scale)[:, None]
+        _launch_grad(q_local, d_full, pos, div, dQ, dQ,
                      inv_temperature, margin, grad_scale, two_sided=False)
         if ctx.use_qq:
             dQ_partial = torch.zeros(batch_size, d_model, device=device, dtype=torch.float32)
-            _launch_grad(q_local, q_full, pos, sum_exp_row, dQ, dQ_partial,
+            _launch_grad(q_local, q_full, pos, div, dQ, dQ_partial,
                          inv_temperature, margin, grad_scale,
                          exclude_diag=True, row_offset=offset, two_sided=True)
             if world > 1:
@@ -227,28 +262,30 @@ class DistributedMemoryEfficientLiTEmbeddingLossNormed(torch.autograd.Function):
 
         if h_local is not None:
             p_h = (_hard_negative_exp(q_local, h_local, pos, inv_temperature, margin)
-                   / sum_exp_row[:, None])
+                   / div[:, None])
             dQ += grad_scale * torch.einsum('bk,bkd->bd', p_h, h_local.float())
 
         dQ = dQ * grad_output
-        return (dQ.to(ctx.in_dtype), None, None,
-                None, None, None, None, None, None, None, None, None, None, None, None)
+        return (dQ.to(ctx.in_dtype), None, None, None, None, None, None, None,
+                None, None, None, None, None, None, None, None, None)
 
 
-class DistributedMemoryEfficientLiTEmbeddingLoss(nn.Module):
+class DistributedMemoryEfficientLiTQwen3Loss(nn.Module):
     """DDP counterpart, feed each rank its shard of the global batch. Only the query
     shard gets a gradient, so no gradient communication happens unless q-q negatives
     are enabled (one reduce-scatter then). forward returns this rank's partial loss
     (all-reduce SUM for the global value).
     """
     def __init__(self, temperature=0.07, margin=0.1, use_qq_negatives=False,
-                 normalized_inputs=False, stable=False, group=None):
+                 normalized_inputs=False, stable=False, tau_plus=0.0, group=None):
         super().__init__()
+        _validate_tau_plus(tau_plus)
         self.temperature = temperature
         self.margin = margin
         self.use_qq_negatives = use_qq_negatives
         self.normalized_inputs = normalized_inputs
         self.stable = stable
+        self.tau_plus = tau_plus
         self.group = group
 
     def forward(self, query_features, doc_features, hard_negative_features=None):
@@ -276,7 +313,8 @@ class DistributedMemoryEfficientLiTEmbeddingLoss(nn.Module):
             q.detach(), d.detach(), pos, inv_temperature, self.margin,
             self.use_qq_negatives, self.group)
         offset = rank * local_batch
-        return DistributedMemoryEfficientLiTEmbeddingLossNormed.apply(
+        return DistributedMemoryEfficientLiTQwen3LossNormed.apply(
             q, d, h, d_full, q_full, pos, sum_exp_row,
             offset, local_batch, inv_temperature, inv_temperature_orig, self.margin,
-            self.use_qq_negatives, batch_size, self.group)
+            self.use_qq_negatives, self.tau_plus, math.exp(-2.0 / self.temperature),
+            batch_size, self.group)
