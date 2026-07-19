@@ -21,32 +21,24 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-
-# tf32 tensor-core matmuls (Triton's default for an fp32 dot), kept explicit so the
-# precision is easy to change; ~1e-3 relative error against ieee.
-INPUT_PRECISION = "tf32"
-_LN2 = 0.6931471805599453   # ln(2): converts the exp2 (log2-domain) logits back to nats
-
-# Backward tile (BLOCK_SIZE_I, BLOCK_SIZE_J, num_warps, num_stages) for clip_grad_both_kernel,
-# keyed by compute capability (major * 10 + minor). A 128x128 tile at num_stages >= 3 exceeds
-# shared memory on sm80/sm100, so those architectures use narrower tiles.
-_BACKWARD_BLOCKS = {
-    80: (128, 64, 8, 2),    # A100
-    90: (128, 128, 8, 2),   # H100
-    100: (64, 128, 8, 2),   # B200
-}
-_DEFAULT_BLOCKS = (128, 64, 8, 2)
-
-
-def _backward_blocks(device):
-    cap = torch.cuda.get_device_capability(device)
-    return _BACKWARD_BLOCKS.get(cap[0] * 10 + cap[1], _DEFAULT_BLOCKS)
-
-
-def _world_and_rank(group):
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size(group), dist.get_rank(group)
-    return 1, 0
+try:
+    from ._common import (
+        INPUT_PRECISION,           # tf32 by default, MEMEFF_INPUT_PRECISION overrides
+        LN2 as _LN2,
+        backward_blocks as _backward_blocks,
+        check_dims as _check_dims,
+        validate_features as _validate_features,
+        world_and_rank as _world_and_rank,
+    )
+except ImportError:   # running as a flat module from inside the repo
+    from _common import (
+        INPUT_PRECISION,
+        LN2 as _LN2,
+        backward_blocks as _backward_blocks,
+        check_dims as _check_dims,
+        validate_features as _validate_features,
+        world_and_rank as _world_and_rank,
+    )
 
 
 @triton.jit
@@ -147,7 +139,7 @@ def _launch_denom(x_block, y_block, sum_exp_row, sum_exp_col, inv_temperature):
     grid = (triton.cdiv(n_i, 128), triton.cdiv(n_j, 128))
     clip_denom_kernel[grid](
         x_block, y_block, sum_exp_row, sum_exp_col, n_i, n_j, inv_temperature,
-        BLOCK_SIZE_I=128, BLOCK_SIZE_J=128, BLOCK_SIZE_D=min(64, d_model),
+        BLOCK_SIZE_I=128, BLOCK_SIZE_J=128, BLOCK_SIZE_D=_check_dims(d_model),
         D_MODEL=d_model, INPUT_PRECISION=INPUT_PRECISION,
     )
 
@@ -221,7 +213,7 @@ def _ring_backward(x_local, y_full, sum_exp_row, sum_exp_col, offset, n,
     clip_grad_both_kernel[grid](
         x_local, y_full, sum_exp_row, sum_exp_col, dX, dY_partial,
         inv_temperature, inv_temperature_orig, n, batch_size,
-        BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j, BLOCK_SIZE_D=min(64, d_model),
+        BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j, BLOCK_SIZE_D=_check_dims(d_model),
         D_MODEL=d_model, INPUT_PRECISION=INPUT_PRECISION,
         num_warps=num_warps, num_stages=num_stages,
     )
@@ -281,9 +273,7 @@ class DistributedMemoryEfficientCLIPLoss(nn.Module):
         x = image_features if self.normalized_inputs else F.normalize(image_features, dim=1)
         y = text_features if self.normalized_inputs else F.normalize(text_features, dim=1)
         x, y = x.contiguous(), y.contiguous()   # the kernels index the shards row-major
-
-        assert x.is_cuda and y.is_cuda
-        assert x.shape == y.shape
+        _validate_features(x, y)
 
         world, rank = _world_and_rank(self.group)
         local_batch = x.shape[0]

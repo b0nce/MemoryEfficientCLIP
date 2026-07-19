@@ -25,22 +25,29 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-
-# tf32 tensor-core matmuls (Triton's default for an fp32 dot), kept explicit so the
-# precision is easy to change; ~1e-3 relative error against ieee.
-INPUT_PRECISION = "tf32"
-_LN2 = 0.6931471805599453   # ln(2): converts the exp2 (log2-domain) logits back to nats
+try:
+    from ._common import (
+        INPUT_PRECISION,           # tf32 by default, MEMEFF_INPUT_PRECISION overrides
+        LN2 as _LN2,
+        check_dims as _check_dims,
+        ring_post as _ring_post,
+        validate_features as _validate_features,
+        world_and_rank as _world_and_rank,
+    )
+except ImportError:   # running as a flat module from inside the repo
+    from _common import (
+        INPUT_PRECISION,
+        LN2 as _LN2,
+        check_dims as _check_dims,
+        ring_post as _ring_post,
+        validate_features as _validate_features,
+        world_and_rank as _world_and_rank,
+    )
 
 # Backward tile (BLOCK_SIZE_I, BLOCK_SIZE_J, num_warps, num_stages) for lit_grad_kernel.
 # Its single output GEMM (the image tower is locked) leaves enough shared memory for a
 # 128x128 tile at num_stages=3 from Ampere through Blackwell, so one tile serves every arch.
 _BACKWARD_TILE = (128, 128, 8, 3)
-
-
-def _world_and_rank(group):
-    if dist.is_available() and dist.is_initialized():
-        return dist.get_world_size(group), dist.get_rank(group)
-    return 1, 0
 
 
 @triton.jit
@@ -131,7 +138,7 @@ def _launch_denom(x_text, y_block, sum_exp_row, inv_temperature):
     grid = (triton.cdiv(n_i, 128), triton.cdiv(n_j, 128))
     lit_denom_kernel[grid](
         x_text, y_block, sum_exp_row, n_i, n_j, inv_temperature,
-        BLOCK_SIZE_I=128, BLOCK_SIZE_J=128, BLOCK_SIZE_D=min(64, d_model),
+        BLOCK_SIZE_I=128, BLOCK_SIZE_J=128, BLOCK_SIZE_D=_check_dims(d_model),
         D_MODEL=d_model, INPUT_PRECISION=INPUT_PRECISION,
     )
 
@@ -144,21 +151,10 @@ def _launch_grad(x_text, y_block, sum_exp_row, scale, dX, inv_temperature):
     grid = (triton.cdiv(n_i, block_i), triton.cdiv(n_j, block_j))
     lit_grad_kernel[grid](
         x_text, y_block, sum_exp_row, dX, inv_temperature, scale, n_i, n_j,
-        BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j, BLOCK_SIZE_D=min(64, d_model),
+        BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j, BLOCK_SIZE_D=_check_dims(d_model),
         D_MODEL=d_model, INPUT_PRECISION=INPUT_PRECISION,
         num_warps=num_warps, num_stages=num_stages,
     )
-
-
-def _ring_post(tensor, send_to, recv_from, group):
-    """Post the send of `tensor` to (rank + 1) and a matching recv from (rank - 1), returning
-    the recv buffer and the work handles. Posting before the block's kernel lets the transfer
-    (on the NCCL stream) overlap the matmul (on the compute stream). Grouped batch_isend_irecv
-    is required: ungrouped ring P2P deadlocks under NCCL."""
-    recv = torch.empty_like(tensor)
-    ops = [dist.P2POp(dist.isend, tensor.contiguous(), send_to, group=group),
-           dist.P2POp(dist.irecv, recv, recv_from, group=group)]
-    return recv, dist.batch_isend_irecv(ops)
 
 
 class DistributedMemoryEfficientLiTLossNormed(torch.autograd.Function):
@@ -234,9 +230,7 @@ class DistributedMemoryEfficientLiTLoss(nn.Module):
         x = text_features if self.normalized_inputs else F.normalize(text_features, dim=1)
         y = image_features if self.normalized_inputs else F.normalize(image_features, dim=1)
         x, y = x.contiguous(), y.contiguous()   # the kernels index the shards row-major
-
-        assert x.is_cuda and y.is_cuda
-        assert x.shape == y.shape
+        _validate_features(x, y)
 
         world, _ = _world_and_rank(self.group)
         local_batch = x.shape[0]
