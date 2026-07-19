@@ -25,28 +25,21 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-try:
-    from ._common import (
-        INPUT_PRECISION,           # tf32 by default, MEMEFF_INPUT_PRECISION overrides
-        LN2 as _LN2,
-        check_dims as _check_dims,
-        debias_denominators as _debias_denominators,
-        ring_post as _ring_post,
-        validate_features as _validate_features,
-        validate_tau_plus as _validate_tau_plus,
-        world_and_rank as _world_and_rank,
-    )
-except ImportError:   # running as a flat module from inside the repo
-    from _common import (
-        INPUT_PRECISION,
-        LN2 as _LN2,
-        check_dims as _check_dims,
-        debias_denominators as _debias_denominators,
-        ring_post as _ring_post,
-        validate_features as _validate_features,
-        validate_tau_plus as _validate_tau_plus,
-        world_and_rank as _world_and_rank,
-    )
+from ._common import (
+    INPUT_PRECISION,           # tf32 by default, MEMEFF_INPUT_PRECISION overrides
+    LN2 as _LN2,
+    LOG2E as _LOG2E,
+    check_dims as _check_dims,
+    clip_smoothing_term as _clip_smoothing_term,
+    debias_denominators as _debias_denominators,
+    resolve_tau_plus as _resolve_tau_plus,
+    ring_post as _ring_post,
+    validate_features as _validate_features,
+    validate_label_smoothing as _validate_label_smoothing,
+    validate_tau_plus as _validate_tau_plus,
+    world_and_rank as _world_and_rank,
+)
+
 
 # Backward tile (BLOCK_SIZE_I, BLOCK_SIZE_J, num_warps, num_stages) for lit_grad_kernel.
 # Its single output GEMM (the image tower is locked) leaves enough shared memory for a
@@ -187,7 +180,7 @@ class DistributedMemoryEfficientLiTLossNormed(torch.autograd.Function):
         # The row denominators are complete locally, so the debiased transform is too.
         sv = (x_text.float() * y_img.float()).sum(dim=1) * inv_temperature - inv_temperature
         denom, div, seed = sum_exp_row, sum_exp_row, None
-        if tau_plus:
+        if tau_plus is not None:
             denom, div, seed = _debias_denominators(
                 torch.exp2(sv), sum_exp_row, batch_size - 1, tau_plus, floor)
 
@@ -239,18 +232,26 @@ class DistributedMemoryEfficientLiTLoss(nn.Module):
 
     tau_plus > 0 switches to the debiased contrastive loss (arXiv 2007.00224). The row
     denominators are complete on their home rank, so debiasing adds no communication.
+    forward also accepts a per-call tau_plus override -- a float or a (local_batch,)
+    tensor of per-row priors in [0, 1) for this rank's shard.
+
+    label_smoothing > 0 smooths the row softmax targets with the F.cross_entropy
+    convention: (1 - eps) on the diagonal plus eps/global_batch uniform. O(batch *
+    dim) eager math plus one O(dim) all-reduce; composes with stable and tau_plus.
     """
     def __init__(self, temperature=0.07, normalized_inputs=False, stable=False,
-                 tau_plus=0.0, group=None):
+                 tau_plus=0.0, label_smoothing=0.0, group=None):
         super().__init__()
         _validate_tau_plus(tau_plus)
+        _validate_label_smoothing(label_smoothing)
         self.temperature = temperature
         self.normalized_inputs = normalized_inputs
         self.stable = stable
         self.tau_plus = tau_plus
+        self.label_smoothing = label_smoothing
         self.group = group
 
-    def forward(self, text_features, image_features):
+    def forward(self, text_features, image_features, tau_plus=None):
         x = text_features if self.normalized_inputs else F.normalize(text_features, dim=1)
         y = image_features if self.normalized_inputs else F.normalize(image_features, dim=1)
         x, y = x.contiguous(), y.contiguous()   # the kernels index the shards row-major
@@ -259,12 +260,19 @@ class DistributedMemoryEfficientLiTLoss(nn.Module):
         world, _ = _world_and_rank(self.group)
         local_batch = x.shape[0]
         batch_size = world * local_batch
-        inv_temperature = 1.4426950408889634 / self.temperature
+        tau_plus = _resolve_tau_plus(self.tau_plus, tau_plus, local_batch, x.device)
+        inv_temperature = _LOG2E / self.temperature
         inv_temperature_orig = (math.sqrt(batch_size / self.temperature)
                                 if self.stable else 1.0 / self.temperature)
         scale = inv_temperature_orig / batch_size
 
         # image is locked -> detach so no gradient is tracked for it.
-        return DistributedMemoryEfficientLiTLossNormed.apply(
-            x, y.detach(), inv_temperature, scale, self.tau_plus,
+        loss = DistributedMemoryEfficientLiTLossNormed.apply(
+            x, y.detach(), inv_temperature, scale, tau_plus,
             math.exp(-2.0 / self.temperature), batch_size, self.group)
+        if self.label_smoothing:
+            grad_factor = self.temperature * inv_temperature_orig if self.stable else 1.0
+            loss = loss + _clip_smoothing_term(x, y.detach(), self.label_smoothing,
+                                               batch_size, self.temperature,
+                                               grad_factor, self.group, world)
+        return loss

@@ -1,9 +1,10 @@
 """Memory-efficient CLIP, LiT, and Qwen3 losses (Triton kernels).
 
-Usable either as a package (clone next to your project and
-`from MemoryEfficientCLIP import MemoryEfficientCLIPLoss`) or as flat modules from
-inside the repo (`from clip_loss import MemoryEfficientCLIPLoss`).
+`pip install memeff`, then `from memeff import MemoryEfficientCLIPLoss` -- every
+public class is re-exported here.
 """
+__version__ = "0.1.0"
+
 from .clip_loss import MemoryEfficientCLIPLoss, StableMemoryEfficientCLIPLoss
 from .lit_loss import MemoryEfficientLiTLoss, StableMemoryEfficientLiTLoss
 from .distributed_clip_loss import DistributedMemoryEfficientCLIPLoss

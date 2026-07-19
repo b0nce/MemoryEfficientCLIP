@@ -14,34 +14,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-try:
-    from ._common import (
-        LN2 as _LN2,
-        LOG2E as _LOG2E,
-        debias_denominators as _debias_denominators,
-        hard_negative_exp as _hard_negative_exp,
-        launch_qwen3_denom as _launch_denom,
-        launch_qwen3_grad as _launch_grad,
-        qwen3_num_negatives as _num_negatives,
-        validate_features as _validate_features,
-        validate_hard_negatives as _validate_hard_negatives,
-        validate_tau_plus as _validate_tau_plus,
-        world_and_rank as _world_and_rank,
-    )
-except ImportError:   # running as a flat module from inside the repo
-    from _common import (
-        LN2 as _LN2,
-        LOG2E as _LOG2E,
-        debias_denominators as _debias_denominators,
-        hard_negative_exp as _hard_negative_exp,
-        launch_qwen3_denom as _launch_denom,
-        launch_qwen3_grad as _launch_grad,
-        qwen3_num_negatives as _num_negatives,
-        validate_features as _validate_features,
-        validate_hard_negatives as _validate_hard_negatives,
-        validate_tau_plus as _validate_tau_plus,
-        world_and_rank as _world_and_rank,
-    )
+from ._common import (
+    LN2 as _LN2,
+    LOG2E as _LOG2E,
+    debias_denominators as _debias_denominators,
+    hard_negative_exp as _hard_negative_exp,
+    launch_qwen3_denom as _launch_denom,
+    launch_qwen3_grad as _launch_grad,
+    qwen3_assemble_ring as _assemble_ring,
+    qwen3_num_negatives as _num_negatives,
+    qwen3_smoothing_term as _qwen3_smoothing_term,
+    resolve_tau_plus as _resolve_tau_plus,
+    validate_features as _validate_features,
+    validate_hard_negatives as _validate_hard_negatives,
+    validate_label_smoothing as _validate_label_smoothing,
+    validate_tau_plus as _validate_tau_plus,
+    world_and_rank as _world_and_rank,
+)
 
 
 class MemoryEfficientLiTQwen3LossNormed(torch.autograd.Function):
@@ -60,7 +49,7 @@ class MemoryEfficientLiTQwen3LossNormed(torch.autograd.Function):
 
         sv = pos * inv_temperature - inv_temperature
         denom, div, seed = sum_exp_row, sum_exp_row, None
-        if tau_plus:
+        if tau_plus is not None:
             denom, div, seed = _debias_denominators(
                 torch.exp2(sv), sum_exp_row,
                 _num_negatives(batch_size, h, use_qq, False), tau_plus, floor)
@@ -109,20 +98,28 @@ class MemoryEfficientLiTQwen3Loss(nn.Module):
     Hard negatives have shape (batch, K, dim). margin >= 2 disables the mask.
     stable=True rescales the gradient by sqrt(batch / temperature), and tau_plus > 0
     switches to the debiased contrastive loss (arXiv 2007.00224); see
-    clip_qwen3_loss.py for both.
+    clip_qwen3_loss.py for both. forward also accepts a per-call tau_plus override
+    -- a float or a (batch,) tensor of per-row priors in [0, 1). label_smoothing > 0
+    smooths the target over the nominal candidates as in MemoryEfficientQwen3Loss
+    (the smoothing attraction toward locked documents and hard negatives lands only
+    on the queries).
     """
     def __init__(self, temperature=0.07, margin=0.1, use_qq_negatives=False,
-                 normalized_inputs=False, stable=False, tau_plus=0.0):
+                 normalized_inputs=False, stable=False, tau_plus=0.0,
+                 label_smoothing=0.0):
         super().__init__()
         _validate_tau_plus(tau_plus)
+        _validate_label_smoothing(label_smoothing)
         self.temperature = temperature
         self.margin = margin
         self.use_qq_negatives = use_qq_negatives
         self.normalized_inputs = normalized_inputs
         self.stable = stable
         self.tau_plus = tau_plus
+        self.label_smoothing = label_smoothing
 
-    def forward(self, query_features, doc_features, hard_negative_features=None):
+    def forward(self, query_features, doc_features, hard_negative_features=None,
+                tau_plus=None):
         q, d, h = query_features, doc_features, hard_negative_features
         if not self.normalized_inputs:
             q = F.normalize(q, dim=-1)
@@ -136,64 +133,22 @@ class MemoryEfficientLiTQwen3Loss(nn.Module):
             _validate_hard_negatives(q, h)
 
         batch_size = q.shape[0]
+        tau_plus = _resolve_tau_plus(self.tau_plus, tau_plus, batch_size, q.device)
         inv_temperature = _LOG2E / self.temperature
         inv_temperature_orig = (math.sqrt(batch_size / self.temperature)
                                 if self.stable else 1.0 / self.temperature)
-        return MemoryEfficientLiTQwen3LossNormed.apply(
+        loss = MemoryEfficientLiTQwen3LossNormed.apply(
             q, d, h, inv_temperature, inv_temperature_orig, self.margin,
-            self.use_qq_negatives, self.tau_plus, math.exp(-2.0 / self.temperature))
-
-
-def _assemble_ring(q_local, d_local, pos, inv_temperature, margin, use_qq, group):
-    """Assembles the document tower (and query tower iff use_qq) while accumulating
-    the home rows' denominators."""
-    world, rank = _world_and_rank(group)
-    local_batch, d_model = q_local.shape
-    device = q_local.device
-    row_offset = rank * local_batch
-    sum_exp_row = torch.zeros(local_batch, device=device, dtype=torch.float32)
-
-    if world == 1:
-        _launch_denom(q_local, d_local, pos, sum_exp_row, inv_temperature, margin)
-        if use_qq:
-            _launch_denom(q_local, q_local, pos, sum_exp_row, inv_temperature, margin,
-                          exclude_diag=True)
-        return d_local.contiguous(), (q_local.contiguous() if use_qq else None), sum_exp_row
-
-    batch_size = world * local_batch
-    d_full = torch.empty(batch_size, d_model, device=device, dtype=d_local.dtype)
-    q_full = (torch.empty(batch_size, d_model, device=device, dtype=q_local.dtype)
-              if use_qq else None)
-    send_to, recv_from = (rank + 1) % world, (rank - 1) % world
-
-    cur_d = d_local.contiguous().clone()
-    cur_q = q_local.contiguous().clone() if use_qq else None
-    for hop in range(world):
-        src = (rank - hop) % world
-        col_offset = src * local_batch
-        reqs = None
-        if hop + 1 < world:
-            recv_d = torch.empty_like(cur_d)
-            ops = [dist.P2POp(dist.isend, cur_d, send_to, group=group),
-                   dist.P2POp(dist.irecv, recv_d, recv_from, group=group)]
-            if use_qq:
-                recv_q = torch.empty_like(cur_q)
-                ops += [dist.P2POp(dist.isend, cur_q, send_to, group=group),
-                        dist.P2POp(dist.irecv, recv_q, recv_from, group=group)]
-            reqs = dist.batch_isend_irecv(ops)
-        d_full.narrow(0, col_offset, local_batch).copy_(cur_d)
-        _launch_denom(q_local, cur_d, pos, sum_exp_row, inv_temperature, margin)
-        if use_qq:
-            q_full.narrow(0, col_offset, local_batch).copy_(cur_q)
-            _launch_denom(q_local, cur_q, pos, sum_exp_row, inv_temperature, margin,
-                          exclude_diag=True, row_offset=row_offset, col_offset=col_offset)
-        if reqs is not None:
-            for req in reqs:
-                req.wait()
-            cur_d = recv_d
-            if use_qq:
-                cur_q = recv_q
-    return d_full, q_full, sum_exp_row
+            self.use_qq_negatives, tau_plus, math.exp(-2.0 / self.temperature))
+        if self.label_smoothing:
+            grad_factor = self.temperature * inv_temperature_orig if self.stable else 1.0
+            loss = loss + _qwen3_smoothing_term(
+                q, d.detach(), h.detach() if h is not None else None,
+                self.label_smoothing,
+                _num_negatives(batch_size, h, self.use_qq_negatives, False),
+                batch_size, self.temperature, grad_factor,
+                self.use_qq_negatives, False)
+        return loss
 
 
 class DistributedMemoryEfficientLiTQwen3LossNormed(torch.autograd.Function):
@@ -209,7 +164,7 @@ class DistributedMemoryEfficientLiTQwen3LossNormed(torch.autograd.Function):
         # transform needs no communication.
         sv = pos * inv_temperature - inv_temperature
         denom, div, seed = sum_exp_row, sum_exp_row, None
-        if tau_plus:
+        if tau_plus is not None:
             denom, div, seed = _debias_denominators(
                 torch.exp2(sv), sum_exp_row,
                 _num_negatives(batch_size, h_local, use_qq, False), tau_plus, floor)
@@ -274,21 +229,28 @@ class DistributedMemoryEfficientLiTQwen3Loss(nn.Module):
     """DDP counterpart, feed each rank its shard of the global batch. Only the query
     shard gets a gradient, so no gradient communication happens unless q-q negatives
     are enabled (one reduce-scatter then). forward returns this rank's partial loss
-    (all-reduce SUM for the global value).
+    (all-reduce SUM for the global value). forward accepts a per-call tau_plus
+    override -- a float or a (local_batch,) tensor of per-row priors in [0, 1) for
+    this rank's shard (adds no communication). label_smoothing > 0 smooths the
+    target over the nominal candidates (adds one O(dim) all-reduce).
     """
     def __init__(self, temperature=0.07, margin=0.1, use_qq_negatives=False,
-                 normalized_inputs=False, stable=False, tau_plus=0.0, group=None):
+                 normalized_inputs=False, stable=False, tau_plus=0.0,
+                 label_smoothing=0.0, group=None):
         super().__init__()
         _validate_tau_plus(tau_plus)
+        _validate_label_smoothing(label_smoothing)
         self.temperature = temperature
         self.margin = margin
         self.use_qq_negatives = use_qq_negatives
         self.normalized_inputs = normalized_inputs
         self.stable = stable
         self.tau_plus = tau_plus
+        self.label_smoothing = label_smoothing
         self.group = group
 
-    def forward(self, query_features, doc_features, hard_negative_features=None):
+    def forward(self, query_features, doc_features, hard_negative_features=None,
+                tau_plus=None):
         q, d, h = query_features, doc_features, hard_negative_features
         if not self.normalized_inputs:
             q = F.normalize(q, dim=-1)
@@ -304,6 +266,7 @@ class DistributedMemoryEfficientLiTQwen3Loss(nn.Module):
         world, rank = _world_and_rank(self.group)
         local_batch = q.shape[0]
         batch_size = world * local_batch
+        tau_plus = _resolve_tau_plus(self.tau_plus, tau_plus, local_batch, q.device)
         inv_temperature = _LOG2E / self.temperature
         inv_temperature_orig = (math.sqrt(batch_size / self.temperature)
                                 if self.stable else 1.0 / self.temperature)
@@ -311,10 +274,19 @@ class DistributedMemoryEfficientLiTQwen3Loss(nn.Module):
         pos = (q.detach().float() * d.detach().float()).sum(dim=1)
         d_full, q_full, sum_exp_row = _assemble_ring(
             q.detach(), d.detach(), pos, inv_temperature, self.margin,
-            self.use_qq_negatives, self.group)
+            self.use_qq_negatives, False, self.group)
         offset = rank * local_batch
-        return DistributedMemoryEfficientLiTQwen3LossNormed.apply(
+        loss = DistributedMemoryEfficientLiTQwen3LossNormed.apply(
             q, d, h, d_full, q_full, pos, sum_exp_row,
             offset, local_batch, inv_temperature, inv_temperature_orig, self.margin,
-            self.use_qq_negatives, self.tau_plus, math.exp(-2.0 / self.temperature),
+            self.use_qq_negatives, tau_plus, math.exp(-2.0 / self.temperature),
             batch_size, self.group)
+        if self.label_smoothing:
+            grad_factor = self.temperature * inv_temperature_orig if self.stable else 1.0
+            loss = loss + _qwen3_smoothing_term(
+                q, d.detach(), h.detach() if h is not None else None,
+                self.label_smoothing,
+                _num_negatives(batch_size, h, self.use_qq_negatives, False),
+                batch_size, self.temperature, grad_factor,
+                self.use_qq_negatives, False, self.group, world)
+        return loss

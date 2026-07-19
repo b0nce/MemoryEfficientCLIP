@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "memeff"
+version = "0.1.0"
+description = "Memory-efficient contrastive losses (CLIP, LiT, Qwen3-Embedding InfoNCE) with Triton kernels"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Mikhail Kindulov" }]
+requires-python = ">=3.9"
+# Triton >= 3.0 is also required at runtime; it ships with the Linux torch wheels,
+# so it is not pinned here to avoid fighting torch's own triton pin.
+dependencies = ["torch>=2.0"]
+keywords = ["clip", "contrastive-learning", "triton", "deep-learning", "loss"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+
+[project.urls]
+Homepage = "https://github.com/b0nce/MemoryEfficientCLIP"
+Repository = "https://github.com/b0nce/MemoryEfficientCLIP"
+
+[tool.setuptools]
+packages = ["memeff"]

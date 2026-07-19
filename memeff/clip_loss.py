@@ -12,16 +12,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from ._common import (LOG2E as _LOG2E, debias_denominators as _debias_denominators,
-                          validate_features as _validate_features,
-                          validate_tau_plus as _validate_tau_plus)
-    from .distributed_clip_loss import _launch_denom, _partial_loss, _ring_backward
-except ImportError:   # running as a flat module from inside the repo
-    from _common import (LOG2E as _LOG2E, debias_denominators as _debias_denominators,
-                         validate_features as _validate_features,
-                         validate_tau_plus as _validate_tau_plus)
-    from distributed_clip_loss import _launch_denom, _partial_loss, _ring_backward
+from ._common import (LOG2E as _LOG2E, clip_smoothing_term as _clip_smoothing_term,
+                      debias_denominators as _debias_denominators,
+                      resolve_tau_plus as _resolve_tau_plus,
+                      validate_features as _validate_features,
+                      validate_label_smoothing as _validate_label_smoothing,
+                      validate_tau_plus as _validate_tau_plus)
+from .distributed_clip_loss import _launch_denom, _partial_loss, _ring_backward
 
 
 class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
@@ -34,7 +31,7 @@ class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
 
         denom_row, denom_col = sum_exp_row, sum_exp_col
         div_row, div_col, seed = sum_exp_row, sum_exp_col, None
-        if tau_plus:
+        if tau_plus is not None:
             pos_exp = torch.exp2((x.float() * y.float()).sum(dim=1)
                                  * inv_temperature - inv_temperature)
             denom_row, div_row, seed_row = _debias_denominators(
@@ -86,30 +83,45 @@ class MemoryEfficientCLIPLoss(nn.Module):
     tau_plus > 0 switches to the debiased contrastive loss (arXiv 2007.00224): the
     negative sum in each softmax denominator is replaced by its debiased estimate
     under a class prior of tau_plus (the probability that an in-batch negative is
-    actually a positive). tau_plus = 0 is the standard loss.
+    actually a positive). tau_plus = 0 is the standard loss. forward also accepts a
+    per-call tau_plus override -- a float or a (batch,) tensor of per-row priors in
+    [0, 1) (e.g. when duplicate rates are known per sample); sample i's prior is
+    applied to both its row and its column softmax.
+
+    label_smoothing > 0 smooths the targets of both softmaxes with the
+    F.cross_entropy convention: (1 - eps) on the diagonal plus eps/batch uniform.
+    Costs only O(batch * dim) eager math; composes with stable and tau_plus.
     """
     def __init__(self, temperature=0.07, normalized_inputs=False, stable=False,
-                 tau_plus=0.0):
+                 tau_plus=0.0, label_smoothing=0.0):
         super().__init__()
         _validate_tau_plus(tau_plus)
+        _validate_label_smoothing(label_smoothing)
         self.temperature = temperature
         self.normalized_inputs = normalized_inputs
         self.stable = stable
         self.tau_plus = tau_plus
+        self.label_smoothing = label_smoothing
 
-    def forward(self, image_features, text_features):
+    def forward(self, image_features, text_features, tau_plus=None):
         x = image_features if self.normalized_inputs else F.normalize(image_features, dim=1)
         y = text_features if self.normalized_inputs else F.normalize(text_features, dim=1)
         x, y = x.contiguous(), y.contiguous()
         _validate_features(x, y)
 
         batch_size = x.shape[0]
+        tau_plus = _resolve_tau_plus(self.tau_plus, tau_plus, batch_size, x.device)
         inv_temperature = _LOG2E / self.temperature
         inv_temperature_orig = (math.sqrt(batch_size / self.temperature)
                                 if self.stable else 1.0 / self.temperature)
-        return MemoryEfficientCLIPLossNormed.apply(
+        loss = MemoryEfficientCLIPLossNormed.apply(
             x, y, inv_temperature, inv_temperature_orig,
-            self.tau_plus, math.exp(-2.0 / self.temperature))
+            tau_plus, math.exp(-2.0 / self.temperature))
+        if self.label_smoothing:
+            grad_factor = self.temperature * inv_temperature_orig if self.stable else 1.0
+            loss = loss + _clip_smoothing_term(x, y, self.label_smoothing, batch_size,
+                                               self.temperature, grad_factor)
+        return loss
 
 
 class StableMemoryEfficientCLIPLoss(MemoryEfficientCLIPLoss):

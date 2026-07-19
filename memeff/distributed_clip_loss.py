@@ -10,8 +10,7 @@ the local rows directly and reduce-scattering the column gradient to its owning 
 `forward` returns THIS rank's contribution to the loss (all-reduce SUM for the global
 scalar). Calling `.backward()` fills the complete gradient of the *global* loss for the
 local shard. Reduction buffers (denominators and gradients) are kept in fp32 regardless
-of the input dtype, so bf16/fp16 features stay numerically safe. See README for the
-derivation of the gradient formula.
+of the input dtype, so bf16/fp16 features stay numerically safe.
 """
 import math
 import torch
@@ -21,28 +20,20 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
-try:
-    from ._common import (
-        INPUT_PRECISION,           # tf32 by default, MEMEFF_INPUT_PRECISION overrides
-        LN2 as _LN2,
-        backward_blocks as _backward_blocks,
-        check_dims as _check_dims,
-        debias_denominators as _debias_denominators,
-        validate_features as _validate_features,
-        validate_tau_plus as _validate_tau_plus,
-        world_and_rank as _world_and_rank,
-    )
-except ImportError:   # running as a flat module from inside the repo
-    from _common import (
-        INPUT_PRECISION,
-        LN2 as _LN2,
-        backward_blocks as _backward_blocks,
-        check_dims as _check_dims,
-        debias_denominators as _debias_denominators,
-        validate_features as _validate_features,
-        validate_tau_plus as _validate_tau_plus,
-        world_and_rank as _world_and_rank,
-    )
+from ._common import (
+    INPUT_PRECISION,           # tf32 by default, MEMEFF_INPUT_PRECISION overrides
+    LN2 as _LN2,
+    LOG2E as _LOG2E,
+    backward_blocks as _backward_blocks,
+    check_dims as _check_dims,
+    clip_smoothing_term as _clip_smoothing_term,
+    debias_denominators as _debias_denominators,
+    resolve_tau_plus as _resolve_tau_plus,
+    validate_features as _validate_features,
+    validate_label_smoothing as _validate_label_smoothing,
+    validate_tau_plus as _validate_tau_plus,
+    world_and_rank as _world_and_rank,
+)
 
 
 @triton.jit
@@ -287,19 +278,29 @@ class DistributedMemoryEfficientCLIPLoss(nn.Module):
     tau_plus > 0 switches to the debiased contrastive loss (arXiv 2007.00224): the
     negative sum in each softmax denominator is replaced by its debiased estimate
     under a class prior of tau_plus. Adds one O(batch) all-gather of the positive
-    exponentials; the kernels are unchanged.
+    exponentials; the kernels are unchanged. forward also accepts a per-call
+    tau_plus override -- a float or a (local_batch,) tensor of per-row priors in
+    [0, 1) for this rank's shard; sample i's prior is applied to both its row and
+    its column softmax (per-row priors add a second O(batch) all-gather).
+
+    label_smoothing > 0 smooths the targets of both softmaxes with the
+    F.cross_entropy convention: (1 - eps) on the diagonal plus eps/global_batch
+    uniform. O(batch * dim) eager math plus one O(dim) all-reduce; composes with
+    stable and tau_plus.
     """
     def __init__(self, temperature=0.07, normalized_inputs=False, stable=False,
-                 tau_plus=0.0, group=None):
+                 tau_plus=0.0, label_smoothing=0.0, group=None):
         super().__init__()
         _validate_tau_plus(tau_plus)
+        _validate_label_smoothing(label_smoothing)
         self.temperature = temperature
         self.normalized_inputs = normalized_inputs
         self.stable = stable
         self.tau_plus = tau_plus
+        self.label_smoothing = label_smoothing
         self.group = group
 
-    def forward(self, image_features, text_features):
+    def forward(self, image_features, text_features, tau_plus=None):
         x = image_features if self.normalized_inputs else F.normalize(image_features, dim=1)
         y = text_features if self.normalized_inputs else F.normalize(text_features, dim=1)
         x, y = x.contiguous(), y.contiguous()   # the kernels index the shards row-major
@@ -308,7 +309,8 @@ class DistributedMemoryEfficientCLIPLoss(nn.Module):
         world, rank = _world_and_rank(self.group)
         local_batch = x.shape[0]
         batch_size = world * local_batch
-        inv_temperature = 1.4426950408889634 / self.temperature
+        tau_plus = _resolve_tau_plus(self.tau_plus, tau_plus, local_batch, x.device)
+        inv_temperature = _LOG2E / self.temperature
         inv_temperature_orig = (math.sqrt(batch_size / self.temperature)
                                 if self.stable else 1.0 / self.temperature)
 
@@ -317,20 +319,30 @@ class DistributedMemoryEfficientCLIPLoss(nn.Module):
         offset = rank * local_batch
         denom_row, denom_col = sum_exp_row, sum_exp_col
         div_row, div_col, seed = sum_exp_row, sum_exp_col, None
-        if self.tau_plus:
+        if tau_plus is not None:
             pos_exp = torch.exp2((x.detach().float() * y.detach().float()).sum(dim=1)
                                  * inv_temperature - inv_temperature)
+            tau_col = tau_plus
             if world > 1:   # the column transform needs every column's positive
                 pos_full = torch.empty(batch_size, device=x.device, dtype=torch.float32)
                 dist.all_gather_into_tensor(pos_full, pos_exp, group=self.group)
+                if isinstance(tau_plus, torch.Tensor):   # ... and every column's prior
+                    tau_col = torch.empty(batch_size, device=x.device, dtype=torch.float32)
+                    dist.all_gather_into_tensor(tau_col, tau_plus, group=self.group)
             else:
                 pos_full = pos_exp
             floor = math.exp(-2.0 / self.temperature)
             denom_row, div_row, seed_row = _debias_denominators(
-                pos_exp, sum_exp_row, batch_size - 1, self.tau_plus, floor)
+                pos_exp, sum_exp_row, batch_size - 1, tau_plus, floor)
             denom_col, div_col, seed_col = _debias_denominators(
-                pos_full, sum_exp_col, batch_size - 1, self.tau_plus, floor)
+                pos_full, sum_exp_col, batch_size - 1, tau_col, floor)
             seed = seed_row + seed_col[offset:offset + local_batch]
-        return DistributedMemoryEfficientCLIPLossNormed.apply(
+        loss = DistributedMemoryEfficientCLIPLossNormed.apply(
             x, y, y_full, denom_row, denom_col, div_row, div_col, seed,
             offset, local_batch, inv_temperature, inv_temperature_orig, batch_size, self.group)
+        if self.label_smoothing:
+            grad_factor = self.temperature * inv_temperature_orig if self.stable else 1.0
+            loss = loss + _clip_smoothing_term(x, y, self.label_smoothing, batch_size,
+                                               self.temperature, grad_factor,
+                                               self.group, world)
+        return loss

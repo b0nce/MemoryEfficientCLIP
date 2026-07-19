@@ -7,6 +7,7 @@ remote_logs/
 results/
 results.tar.gz
 run_remote.sh
+train_gradcache_qwen3.py
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

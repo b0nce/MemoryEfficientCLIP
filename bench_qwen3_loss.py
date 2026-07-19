@@ -14,12 +14,12 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch.profiler import profile, schedule, ProfilerActivity
 
-from clip_qwen3_loss import (
+from memeff.clip_qwen3_loss import (
     MemoryEfficientQwen3Loss, DistributedMemoryEfficientQwen3Loss)
-from lit_qwen3_loss import (
+from memeff.lit_qwen3_loss import (
     MemoryEfficientLiTQwen3Loss, DistributedMemoryEfficientLiTQwen3Loss)
-from clip_loss import MemoryEfficientCLIPLoss
-from distributed_clip_loss import DistributedMemoryEfficientCLIPLoss
+from memeff.clip_loss import MemoryEfficientCLIPLoss
+from memeff.distributed_clip_loss import DistributedMemoryEfficientCLIPLoss
 
 WARMUP, ITERS = 5, 10                       # timing loop (warmup also compiles Triton)
 PROF_STEPS = 6                              # profiler: wait=1, warmup=2, active=3

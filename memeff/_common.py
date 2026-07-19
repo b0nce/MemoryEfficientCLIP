@@ -1,10 +1,10 @@
 """Shared helpers and Triton kernels for the memory-efficient contrastive losses.
 
-Holds everything that was previously copy-pasted across the loss modules: numeric
-constants, the per-architecture backward tile table, distributed helpers, and the
-masked Qwen3-loss kernel pair used by clip_qwen3_loss.py and
-lit_qwen3_loss.py (one kernel pair covers both: the gradient kernel takes a
-TWO_SIDED flag for whether the column direction is emitted).
+Numeric constants, the per-architecture backward tile table, distributed helpers,
+and the masked Qwen3-loss kernel pair plus its ring assembly, shared by
+clip_qwen3_loss.py and lit_qwen3_loss.py (one kernel pair covers both: the
+gradient kernel takes a TWO_SIDED flag for whether the column direction is
+emitted).
 """
 import os
 import torch
@@ -59,6 +59,21 @@ def validate_tau_plus(tau_plus):
         raise ValueError(f"tau_plus must be in [0, 1), got {tau_plus}")
 
 
+def resolve_tau_plus(default, override, batch_size, device):
+    """Merge a per-forward tau_plus override with the module default. Returns None
+    for the biased fast path, a python float, or a (batch,) fp32 tensor of per-row
+    class priors. Tensor values are trusted to lie in [0, 1): checking them would
+    force a GPU sync in the hot path."""
+    tau_plus = default if override is None else override
+    if isinstance(tau_plus, torch.Tensor):
+        if tau_plus.shape != (batch_size,):
+            raise ValueError(f"per-row tau_plus must have shape ({batch_size},) to "
+                             f"match this rank's rows, got {tuple(tau_plus.shape)}")
+        return tau_plus.detach().to(device=device, dtype=torch.float32).contiguous()
+    validate_tau_plus(tau_plus)
+    return tau_plus or None
+
+
 def debias_denominators(pos_exp, sum_exp, num_negatives, tau_plus, floor):
     """Debiased contrastive denominator (arXiv 2007.00224) as a per-row transform.
 
@@ -67,7 +82,8 @@ def debias_denominators(pos_exp, sum_exp, num_negatives, tau_plus, floor):
     in the shift, leaving the loss unchanged. The negative sum is replaced by
     num_negatives * g with g = max((neg_mean - tau_plus * pos) / (1 - tau_plus), floor).
     num_negatives is the nominal negative count: entries a false-negative mask dropped
-    still divide the mean (they contribute zero, they are not re-counted).
+    still divide the mean (they contribute zero, they are not re-counted). tau_plus is
+    a python float or a per-row fp32 tensor broadcasting against pos_exp.
 
     Returns (denom, divisor, seed): the corrected softmax denominator for the loss
     value, the per-row divisor to hand the unchanged grad kernels in place of sum_exp
@@ -85,6 +101,91 @@ def debias_denominators(pos_exp, sum_exp, num_negatives, tau_plus, floor):
     seed = torch.where(clamped, ratio - 1.0,
                        -1.0 - ratio * (tau_plus * (num_negatives + 1) / (1.0 - tau_plus)))
     return denom, divisor, seed
+
+
+def validate_label_smoothing(label_smoothing):
+    if not 0.0 <= label_smoothing < 1.0:
+        raise ValueError(f"label_smoothing must be in [0, 1), got {label_smoothing}")
+
+
+def grad_rescale(value, factor):
+    """Keep the loss value, rescale its gradient by `factor`. Applied to the eager
+    smoothing terms so they match the kernels' stable=True rescaled gradients."""
+    if factor == 1.0:
+        return value
+    return value.detach() + (value - value.detach()) * factor
+
+
+def smoothing_cross(a_sum, b_sum, a_glob, b_glob, world):
+    """<A_global, B_global> as this rank's additive share: the shares sum to the
+    global dot product across ranks while the gradient through the live local sums
+    (a_sum, b_sum) is the full global one. a_glob / b_glob are the detached global
+    sums (unused when world == 1); a locked side simply passes a detached a/b_sum."""
+    if world == 1:
+        return (a_sum * b_sum).sum()
+    return ((a_sum * b_glob).sum() + (a_glob * b_sum).sum()
+            - (a_glob * b_glob).sum() / world)
+
+
+def clip_smoothing_term(x, y, label_smoothing, batch_size, temperature, grad_factor,
+                        group=None, world=1):
+    """Label-smoothing correction to the CLIP/LiT loss, added eagerly outside the
+    kernels. With the F.cross_entropy target convention t = (1-eps) * diag + eps/B,
+    each row's smoothed CE differs from the unsmoothed one by
+    (s_ii - sum_j t_ij s_ij) / temperature -- the log-denominator cancels because
+    the targets sum to 1 -- and summing over rows (and, for CLIP, both directions)
+    collapses to batch scalars:
+
+        corr = (eps * tr(X Y^T) - (eps / B) * <S_x, S_y>) / (B * temperature)
+
+    The same expression covers the row-only LiT loss and both CLIP directions (their
+    row and column shifts sum identically). Autograd through the live x / y supplies
+    the matching gradient; pass a locked tower detached. In DDP each rank returns
+    its share (local trace + its smoothing_cross share); one O(dim) all-reduce."""
+    xf, yf = x.float(), y.float()
+    tr = (xf * yf).sum()
+    sx, sy = xf.sum(0), yf.sum(0)
+    sxg = syg = None
+    if world > 1:
+        glob = torch.stack([sx, sy]).detach().clone()
+        dist.all_reduce(glob, group=group)
+        sxg, syg = glob[0], glob[1]
+    cross = smoothing_cross(sx, sy, sxg, syg, world)
+    corr = (label_smoothing * tr
+            - (label_smoothing / batch_size) * cross) / (batch_size * temperature)
+    return grad_rescale(corr, grad_factor)
+
+
+def qwen3_smoothing_term(q, d, h, label_smoothing, num_negatives, batch_size,
+                         temperature, grad_factor, use_qq, use_dd,
+                         group=None, world=1):
+    """Label-smoothing correction for the Qwen3 losses (same construction as
+    clip_smoothing_term): target (1-eps) * positive + eps/C uniform over the
+    C = num_negatives + 1 nominal candidates. The false-negative mask does not
+    reshape the target (masked entries are presumed positives, a sliver of
+    attraction toward them is the point of smoothing). cand_sum accumulates
+    sum_i sum_candidates s: the q-d block including the positive diagonal, the
+    diagonal-excluded q-q / d-d blocks, and the row-specific hard negatives.
+    Pass locked towers (LiT variant: d and h) detached."""
+    qf, df = q.float(), d.float()
+    tr = (qf * df).sum()
+    sq, sd = qf.sum(0), df.sum(0)
+    sqg = sdg = None
+    if world > 1:
+        glob = torch.stack([sq, sd]).detach().clone()
+        dist.all_reduce(glob, group=group)
+        sqg, sdg = glob[0], glob[1]
+    cand_sum = smoothing_cross(sq, sd, sqg, sdg, world)
+    if use_qq:
+        cand_sum = cand_sum + smoothing_cross(sq, sq, sqg, sqg, world) - (qf * qf).sum()
+    if use_dd:
+        cand_sum = cand_sum + smoothing_cross(sd, sd, sdg, sdg, world) - (df * df).sum()
+    if h is not None:
+        cand_sum = cand_sum + torch.einsum('bd,bkd->', qf, h.float())
+    num_classes = num_negatives + 1
+    corr = (label_smoothing * tr
+            - (label_smoothing / num_classes) * cand_sum) / (batch_size * temperature)
+    return grad_rescale(corr, grad_factor)
 
 
 def validate_features(x, y):
@@ -245,3 +346,66 @@ def launch_qwen3_grad(a, b, pos, sum_exp_row, dA, dB, inv_temperature, margin, g
         D_MODEL=d_model, INPUT_PRECISION=INPUT_PRECISION,
         num_warps=num_warps, num_stages=num_stages,
     )
+
+
+def qwen3_assemble_ring(q_local, d_local, pos, inv_temperature, margin,
+                        use_qq, use_dd, group):
+    """Assembles the document tower (and query tower iff use_qq) while accumulating
+    the home rows' denominators. Only features travel, no denominator communication.
+    The LiT variant passes use_dd=False (locked documents repel nothing)."""
+    world, rank = world_and_rank(group)
+    local_batch, d_model = q_local.shape
+    device = q_local.device
+    row_offset = rank * local_batch
+    sum_exp_row = torch.zeros(local_batch, device=device, dtype=torch.float32)
+
+    if world == 1:
+        launch_qwen3_denom(q_local, d_local, pos, sum_exp_row, inv_temperature, margin)
+        if use_qq:
+            launch_qwen3_denom(q_local, q_local, pos, sum_exp_row, inv_temperature,
+                               margin, exclude_diag=True)
+        if use_dd:
+            launch_qwen3_denom(d_local, d_local, pos, sum_exp_row, inv_temperature,
+                               margin, exclude_diag=True)
+        return d_local.contiguous(), (q_local.contiguous() if use_qq else None), sum_exp_row
+
+    batch_size = world * local_batch
+    d_full = torch.empty(batch_size, d_model, device=device, dtype=d_local.dtype)
+    q_full = (torch.empty(batch_size, d_model, device=device, dtype=q_local.dtype)
+              if use_qq else None)
+    send_to, recv_from = (rank + 1) % world, (rank - 1) % world
+
+    # Travelling blocks are prefetched one hop ahead so the transfer overlaps compute.
+    cur_d = d_local.contiguous().clone()
+    cur_q = q_local.contiguous().clone() if use_qq else None
+    for hop in range(world):
+        src = (rank - hop) % world
+        col_offset = src * local_batch
+        reqs = None
+        if hop + 1 < world:
+            recv_d = torch.empty_like(cur_d)
+            ops = [dist.P2POp(dist.isend, cur_d, send_to, group=group),
+                   dist.P2POp(dist.irecv, recv_d, recv_from, group=group)]
+            if use_qq:
+                recv_q = torch.empty_like(cur_q)
+                ops += [dist.P2POp(dist.isend, cur_q, send_to, group=group),
+                        dist.P2POp(dist.irecv, recv_q, recv_from, group=group)]
+            reqs = dist.batch_isend_irecv(ops)
+        d_full.narrow(0, col_offset, local_batch).copy_(cur_d)
+        launch_qwen3_denom(q_local, cur_d, pos, sum_exp_row, inv_temperature, margin)
+        if use_dd:
+            launch_qwen3_denom(d_local, cur_d, pos, sum_exp_row, inv_temperature, margin,
+                               exclude_diag=True, row_offset=row_offset,
+                               col_offset=col_offset)
+        if use_qq:
+            q_full.narrow(0, col_offset, local_batch).copy_(cur_q)
+            launch_qwen3_denom(q_local, cur_q, pos, sum_exp_row, inv_temperature, margin,
+                               exclude_diag=True, row_offset=row_offset,
+                               col_offset=col_offset)
+        if reqs is not None:
+            for req in reqs:
+                req.wait()
+            cur_d = recv_d
+            if use_qq:
+                cur_q = recv_q
+    return d_full, q_full, sum_exp_row
