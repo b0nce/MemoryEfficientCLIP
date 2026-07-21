@@ -42,7 +42,7 @@ All losses come in a single-GPU and a `Distributed*` (multi-GPU DDP) variant:
 
 - `temperature` — softmax temperature (default 0.07).
 - `normalized_inputs=True` — skip the internal L2 normalization.
-- `stable=True` — rescale gradients by `sqrt(batch / temperature)` instead of `1 / temperature` to avoid fp32 underflow at very large batches (loss value unchanged; see details below).
+- `stable=True` (default) — rescale gradients by `sqrt(batch / temperature)` instead of `1 / temperature` to avoid fp32 underflow at very large batches (loss value unchanged; see details below). Pass `stable=False` for the textbook `1 / temperature` gradient scale.
 - `tau_plus > 0` — the debiased contrastive loss of [Chuang et al., 2020](https://arxiv.org/abs/2007.00224). `forward` also accepts a per-call override: a float or a **(batch,) tensor of per-row priors** — useful when some samples are known to have approximate copies in the dataset. Costs no extra kernels.
 - `label_smoothing > 0` — smoothed softmax targets with the `F.cross_entropy` convention (`(1-eps)` on the positive plus `eps/C` uniform). Costs only O(batch·dim) eager math.
 
@@ -155,7 +155,7 @@ Validated against the per-dim dense reference across the full feature matrix in 
 <details>
 <summary><b>Stable gradient rescaling (<code>stable=True</code>)</b></summary>
 
-`stable=True` rescales the gradient by `sqrt(batch / temperature)` instead of `1 / temperature`: the default `1 / (batch * temperature)` factor can nullify small values even in fp32, which matters at large batch sizes (300k+ works fine in practice). The loss value is unchanged, only the gradient scale differs, so the learning rate becomes batch-size dependent — use `lr / sqrt(batch * temperature)` to mimic the default behaviour, though at large batches standard values like 1e-4 tend to work well without that correction. The old `StableMemoryEfficientCLIPLoss` / `StableMemoryEfficientLiTLoss` classes remain as deprecated aliases.
+`stable=True` (the default) rescales the gradient by `sqrt(batch / temperature)` instead of `1 / temperature`: the textbook `1 / (batch * temperature)` factor can nullify small values even in fp32, which matters at large batch sizes (300k+ works fine in practice). The loss value is unchanged, only the gradient scale differs, so the learning rate becomes batch-size dependent — use `lr / sqrt(batch * temperature)` to mimic `stable=False`, though at large batches standard values like 1e-4 tend to work well without that correction. The old `StableMemoryEfficientCLIPLoss` / `StableMemoryEfficientLiTLoss` classes remain as deprecated aliases.
 
 </details>
 

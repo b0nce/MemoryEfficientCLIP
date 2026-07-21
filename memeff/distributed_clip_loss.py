@@ -288,7 +288,7 @@ class DistributedMemoryEfficientCLIPLoss(nn.Module):
     uniform. O(batch * dim) eager math plus one O(dim) all-reduce; composes with
     stable and tau_plus.
     """
-    def __init__(self, temperature=0.07, normalized_inputs=False, stable=False,
+    def __init__(self, temperature=0.07, normalized_inputs=False, stable=True,
                  tau_plus=0.0, label_smoothing=0.0, group=None):
         super().__init__()
         _validate_tau_plus(tau_plus)

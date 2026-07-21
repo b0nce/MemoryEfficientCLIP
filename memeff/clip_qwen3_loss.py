@@ -125,7 +125,7 @@ class MemoryEfficientQwen3Loss(nn.Module):
     tau_plus.
     """
     def __init__(self, temperature=0.07, margin=0.1, use_qq_negatives=False,
-                 use_dd_negatives=False, normalized_inputs=False, stable=False,
+                 use_dd_negatives=False, normalized_inputs=False, stable=True,
                  tau_plus=0.0, label_smoothing=0.0):
         super().__init__()
         _validate_tau_plus(tau_plus)
@@ -275,7 +275,7 @@ class DistributedMemoryEfficientQwen3Loss(nn.Module):
     O(dim) all-reduce).
     """
     def __init__(self, temperature=0.07, margin=0.1, use_qq_negatives=False,
-                 use_dd_negatives=False, normalized_inputs=False, stable=False,
+                 use_dd_negatives=False, normalized_inputs=False, stable=True,
                  tau_plus=0.0, label_smoothing=0.0, group=None):
         super().__init__()
         _validate_tau_plus(tau_plus)

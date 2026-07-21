@@ -105,7 +105,7 @@ class MemoryEfficientLiTQwen3Loss(nn.Module):
     on the queries).
     """
     def __init__(self, temperature=0.07, margin=0.1, use_qq_negatives=False,
-                 normalized_inputs=False, stable=False, tau_plus=0.0,
+                 normalized_inputs=False, stable=True, tau_plus=0.0,
                  label_smoothing=0.0):
         super().__init__()
         _validate_tau_plus(tau_plus)
@@ -235,7 +235,7 @@ class DistributedMemoryEfficientLiTQwen3Loss(nn.Module):
     target over the nominal candidates (adds one O(dim) all-reduce).
     """
     def __init__(self, temperature=0.07, margin=0.1, use_qq_negatives=False,
-                 normalized_inputs=False, stable=False, tau_plus=0.0,
+                 normalized_inputs=False, stable=True, tau_plus=0.0,
                  label_smoothing=0.0, group=None):
         super().__init__()
         _validate_tau_plus(tau_plus)

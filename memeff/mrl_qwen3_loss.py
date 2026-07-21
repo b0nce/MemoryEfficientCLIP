@@ -459,7 +459,7 @@ class MemoryEfficientMatryoshkaQwen3Loss(nn.Module):
     """
     def __init__(self, dims, weights=None, temperature=0.07, margin=0.1,
                  use_qq_negatives=False, use_dd_negatives=False,
-                 normalized_inputs=False, stable=False, tau_plus=0.0,
+                 normalized_inputs=False, stable=True, tau_plus=0.0,
                  label_smoothing=0.0):
         super().__init__()
         _validate_tau_plus(tau_plus)
@@ -537,7 +537,7 @@ class MemoryEfficientMatryoshkaLiTQwen3Loss(MemoryEfficientMatryoshkaQwen3Loss):
     MemoryEfficientMatryoshkaQwen3Loss.
     """
     def __init__(self, dims, weights=None, temperature=0.07, margin=0.1,
-                 use_qq_negatives=False, normalized_inputs=False, stable=False,
+                 use_qq_negatives=False, normalized_inputs=False, stable=True,
                  tau_plus=0.0, label_smoothing=0.0):
         super().__init__(dims, weights=weights, temperature=temperature,
                          margin=margin, use_qq_negatives=use_qq_negatives,
