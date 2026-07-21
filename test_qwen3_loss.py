@@ -230,8 +230,8 @@ def run_single_lit():
 
             loss_fn = MemoryEfficientLiTQwen3Loss(
                 temperature=TAU, margin=MARGIN, use_qq_negatives=use_qq,
-                normalized_inputs=True, tau_plus=0.0 if per_row else tau_plus,
-                label_smoothing=ls)
+                normalized_inputs=True, stable=False,
+                tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
             qk = q.detach().requires_grad_(True)
             loss = loss_fn(qk, d, h, tau_plus=tau_plus if per_row else None)
             loss.backward()
@@ -270,7 +270,7 @@ def run_distributed():
 
         loss_fn = DistributedMemoryEfficientQwen3Loss(
             temperature=TAU, margin=MARGIN, use_qq_negatives=use_qq,
-            use_dd_negatives=use_dd, normalized_inputs=True,
+            use_dd_negatives=use_dd, normalized_inputs=True, stable=False,
             tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
         qs, ds, hs = leafs(q[rows], d[rows], h[rows] if h is not None else None)
         partial = loss_fn(qs, ds, hs, tau_plus=tau_plus[rows] if per_row else None)
@@ -303,8 +303,8 @@ def run_distributed():
 
         loss_fn = DistributedMemoryEfficientLiTQwen3Loss(
             temperature=TAU, margin=MARGIN, use_qq_negatives=use_qq,
-            normalized_inputs=True, tau_plus=0.0 if per_row else tau_plus,
-            label_smoothing=ls)
+            normalized_inputs=True, stable=False,
+            tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
         qs = q[rows].detach().requires_grad_(True)
         partial = loss_fn(qs, d[rows], h[rows] if h is not None else None,
                           tau_plus=tau_plus[rows] if per_row else None)
@@ -330,7 +330,7 @@ def run_world1_fallbacks():
     ref.backward()
     loss_fn = DistributedMemoryEfficientQwen3Loss(
         temperature=TAU, margin=MARGIN, use_qq_negatives=True,
-        use_dd_negatives=True, normalized_inputs=True)
+        use_dd_negatives=True, normalized_inputs=True, stable=False)
     qk, dk, hk = leafs(q, d, h)
     loss = loss_fn(qk, dk, hk)
     loss.backward()
@@ -346,7 +346,8 @@ def run_world1_fallbacks():
     ref = reference_loss(qr, d, h, use_qq=True)
     ref.backward()
     loss_fn = DistributedMemoryEfficientLiTQwen3Loss(
-        temperature=TAU, margin=MARGIN, use_qq_negatives=True, normalized_inputs=True)
+        temperature=TAU, margin=MARGIN, use_qq_negatives=True,
+        normalized_inputs=True, stable=False)
     qk = q.detach().requires_grad_(True)
     loss = loss_fn(qk, d, h)
     loss.backward()

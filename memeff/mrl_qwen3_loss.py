@@ -4,11 +4,15 @@ dim trained in (almost) one pass over the similarity blocks.
 Raw prefix dots are cumulative across the kernels' feature chunks, and each
 prefix's re-normalization is a per-row scalar (a_i^k = 1/||x_i[:m_k]||), so the
 denom kernel rescales its running dot tile at every prefix boundary and
-accumulates all K denominators in a single sweep. The backward walks the chunks
-twice with a telescoping coefficient tile: the extra cost over the non-MRL kernels is
-m_{K-1}/D of one matmul pass, and the extra state is O(K * batch) scalar tables
-(inverse prefix norms, per-dim positives/divisors, renormalization row sums) --
-no per-dim feature copies, no per-dim gradient buffers.
+accumulates all K denominators in a single sweep. The backward picks between
+two kernels per ladder (see _use_prefix_emission): a single walk that emits
+each boundary's prefix gradient immediately (extra prefix matmuls on
+cache-hot chunks, every exp2/mask sweep run once -- wins at small d_model,
+where the sweeps dominate), or two walks with a telescoping coefficient tile
+(minimal matmuls, K - 1 extra peel sweeps -- wins at large d_model). Either
+way the extra state is O(K * batch) scalar tables (inverse prefix norms,
+per-dim positives/divisors, renormalization row sums) -- no per-dim feature
+copies, no per-dim gradient buffers.
 
 Prefix dims must be strictly increasing multiples of the kernels' feature chunk
 (64 for d_model >= 64) and end exactly at d_model; anything else raises, by
@@ -270,6 +274,85 @@ def mrl_qwen3_grad_kernel(
         lo = hi
 
 
+@triton.jit
+def mrl_qwen3_grad_prefix_kernel(
+    A_ptr, B_ptr, dims_ptr, a_inv_ptr, b_inv_ptr, pos_ptr, div_ptr, w_ptr,
+    dA_ptr, dB_ptr, rho_a_ptr, rho_b_ptr,
+    n_i, n_j, stride_row, stride_col, inv_temperature, margin, grad_scale,
+    row_offset, col_offset,
+    EXCLUDE_DIAG: tl.constexpr, TWO_SIDED: tl.constexpr, NUM_DIMS: tl.constexpr,
+    BLOCK_SIZE_I: tl.constexpr, BLOCK_SIZE_J: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr, D_MODEL: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    """Single chunk walk with per-boundary prefix emission.
+
+    dX[:, :m_k] receives w_k's contribution the moment c^k exists:
+    dA[:, :m_k] += c^k . B[:, :m_k] (and the transposed dB iff TWO_SIDED).
+    Summed over boundaries this equals the telescoping kernel's suffix-sum
+    emissions, but with no second walk, no peel re-computations and no
+    re-accumulated dot tile -- each boundary's exp2/mask sweep runs exactly
+    once. The price is prefix matmul redundancy (sum(dims) instead of D_MODEL
+    chunk passes per side, re-reading early chunks that stay cache-hot), the
+    right trade below the launcher's sweep-cost crossover. The coefficients are
+    cast to the input dtype before emission, so every runtime loop body keeps
+    uniform-dtype tl.dot operands (bf16 tensor-core emissions, and no triton
+    3.1 mixed-dtype pipeliner miscompile; see launch_mrl_grad)."""
+    pid_i = tl.program_id(0)
+    pid_j = tl.program_id(1)
+    i_offsets = pid_i * BLOCK_SIZE_I + tl.arange(0, BLOCK_SIZE_I)
+    j_offsets = pid_j * BLOCK_SIZE_J + tl.arange(0, BLOCK_SIZE_J)
+    i_mask = i_offsets < n_i
+    j_mask = j_offsets < n_j
+
+    R = tl.zeros([BLOCK_SIZE_I, BLOCK_SIZE_J], dtype=tl.float32)
+    lo = 0
+    for k in tl.static_range(NUM_DIMS):
+        hi = tl.load(dims_ptr + k)
+        for d_start in range(lo, hi, BLOCK_SIZE_D):
+            d_offsets = d_start + tl.arange(0, BLOCK_SIZE_D)
+            A_block = tl.load(A_ptr + (i_offsets[:, None] * D_MODEL + d_offsets[None, :]),
+                              mask=i_mask[:, None], other=0.0)
+            B_block = tl.load(B_ptr + (j_offsets[:, None] * D_MODEL + d_offsets[None, :]),
+                              mask=j_mask[:, None], other=0.0)
+            R = tl.dot(A_block, tl.trans(B_block), R, input_precision=INPUT_PRECISION)
+        a_k = tl.load(a_inv_ptr + k * stride_row + i_offsets, mask=i_mask, other=1.0)
+        b_k = tl.load(b_inv_ptr + k * stride_col + col_offset + j_offsets,
+                      mask=j_mask, other=1.0)
+        S = R * a_k[:, None] * b_k[None, :]
+        pos_k = tl.load(pos_ptr + k * stride_row + i_offsets, mask=i_mask, other=0.0)
+        keep = (S <= pos_k[:, None] + margin) & i_mask[:, None] & j_mask[None, :]
+        if EXCLUDE_DIAG:
+            keep = keep & ((i_offsets[:, None] + row_offset) != (j_offsets[None, :] + col_offset))
+        exp_S = tl.where(keep, tl.exp2(S * inv_temperature - inv_temperature), 0.0)
+        div_k = tl.load(div_ptr + k * stride_row + i_offsets, mask=i_mask, other=1.0)
+        w_k = tl.load(w_ptr + k)
+        c = tl.math.fdiv(exp_S, div_k[:, None]) * ((w_k * grad_scale)
+                                                   * a_k[:, None] * b_k[None, :])
+        cR = c * R
+        tl.atomic_add(rho_a_ptr + k * stride_row + i_offsets, tl.sum(cR, axis=1),
+                      mask=i_mask, sem="relaxed")
+        if TWO_SIDED:
+            tl.atomic_add(rho_b_ptr + k * stride_col + col_offset + j_offsets,
+                          tl.sum(cR, axis=0), mask=j_mask, sem="relaxed")
+        c_low = c.to(A_ptr.dtype.element_ty)
+        for d_start in range(0, hi, BLOCK_SIZE_D):
+            d_offsets = d_start + tl.arange(0, BLOCK_SIZE_D)
+            B_block = tl.load(B_ptr + (j_offsets[:, None] * D_MODEL + d_offsets[None, :]),
+                              mask=j_mask[:, None], other=0.0)
+            dA_contrib = tl.dot(c_low, B_block, input_precision=INPUT_PRECISION)
+            tl.atomic_add(dA_ptr + (i_offsets[:, None] * D_MODEL + d_offsets[None, :]),
+                          dA_contrib, mask=i_mask[:, None], sem="relaxed")
+            if TWO_SIDED:
+                A_block = tl.load(A_ptr + (i_offsets[:, None] * D_MODEL + d_offsets[None, :]),
+                                  mask=i_mask[:, None], other=0.0)
+                dB_contrib = tl.dot(tl.trans(c_low), A_block,
+                                    input_precision=INPUT_PRECISION)
+                tl.atomic_add(dB_ptr + (j_offsets[:, None] * D_MODEL + d_offsets[None, :]),
+                              dB_contrib, mask=j_mask[:, None], sem="relaxed")
+        lo = hi
+
+
 def launch_mrl_denom(a, b, dims_t, a_inv, b_inv, pos, sum_exp, inv_temperature,
                      margin, exclude_diag=False, row_offset=0, col_offset=0):
     n_i, d_model = a.shape
@@ -285,25 +368,50 @@ def launch_mrl_denom(a, b, dims_t, a_inv, b_inv, pos, sum_exp, inv_temperature,
     )
 
 
-def launch_mrl_grad(a, b, dims_t, a_inv, b_inv, pos, div, w, dA, dB, rho_a, rho_b,
-                    inv_temperature, margin, grad_scale,
+# One boundary sweep (exp2/mask/atomics over a B^2 tile) costs about as much
+# as this many 64-wide matmul chunk passes (A100, bf16, D=384, 2026-07).
+_SWEEP_CHUNK_COST = 5
+_FORCE_BACKWARD = None  # 'prefix' | 'telescope' -- test hook
+
+
+def _use_prefix_emission(dims, d_model, two_sided, block_d):
+    """The single-walk prefix kernel beats the telescoping two-walk kernel
+    when its extra prefix matmul chunks cost less than the K - 1 peel sweeps
+    (plus the walk-2 re-accumulation) they remove -- i.e. at small
+    d_model / dense ladders, where the sweeps dominate."""
+    if _FORCE_BACKWARD is not None:
+        return _FORCE_BACKWARD == 'prefix'
+    if len(dims) == 1:
+        return False  # identical work either way; keep the older path
+    sides = 2 if two_sided else 1
+    extra_chunks = (sides * (sum(dims) - d_model) - dims[-2]) // block_d
+    return extra_chunks < _SWEEP_CHUNK_COST * (len(dims) - 1)
+
+
+def launch_mrl_grad(a, b, dims, dims_t, a_inv, b_inv, pos, div, w, dA, dB,
+                    rho_a, rho_b, inv_temperature, margin, grad_scale,
                     exclude_diag=False, row_offset=0, col_offset=0, *, two_sided):
     n_i, d_model = a.shape
     n_j = b.shape[0]
     block_i, block_j, num_warps, num_stages = _backward_blocks(a.device)
     grid = (triton.cdiv(n_i, block_i), triton.cdiv(n_j, block_j))
-    # Pipelining is safe only because walk 2 casts every dot operand to fp32:
-    # with mixed bf16/fp32 dots in its loop body, triton 3.1's software
-    # pipeliner corrupts the first segment's emission and the re-accumulated R
-    # at any block size (A100 sm80, 2026-07-21; num_stages=1 also fixes it,
-    # at ~2x backward cost).
-    mrl_qwen3_grad_kernel[grid](
+    block_d = _check_dims(d_model)
+    # Pipelining is safe only with uniform-dtype tl.dot operands per loop body:
+    # with mixed bf16/fp32 dots in one loop, triton 3.1's software pipeliner
+    # corrupts the first segment's emission and the re-accumulated R at any
+    # block size (A100 sm80, 2026-07-21; num_stages=1 also fixes it, at ~2x
+    # backward cost). The telescoping kernel casts its walk-2 operands to
+    # fp32; the prefix kernel casts its coefficients down to the input dtype.
+    kernel = (mrl_qwen3_grad_prefix_kernel
+              if _use_prefix_emission(dims, d_model, two_sided, block_d)
+              else mrl_qwen3_grad_kernel)
+    kernel[grid](
         a, b, dims_t, a_inv, b_inv, pos, div, w, dA, dB, rho_a, rho_b,
         n_i, n_j, a_inv.stride(0), b_inv.stride(0),
         inv_temperature, margin, grad_scale, row_offset, col_offset,
         EXCLUDE_DIAG=exclude_diag, TWO_SIDED=two_sided, NUM_DIMS=dims_t.numel(),
         BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j,
-        BLOCK_SIZE_D=_check_dims(d_model), D_MODEL=d_model,
+        BLOCK_SIZE_D=block_d, D_MODEL=d_model,
         INPUT_PRECISION=_INPUT_PRECISION,
         num_warps=num_warps, num_stages=num_stages,
     )
@@ -380,17 +488,17 @@ class MemoryEfficientMRLQwen3LossNormed(torch.autograd.Function):
         rho_q = torch.zeros(K, batch_size, device=device, dtype=torch.float32)
         rho_d = None if lit else torch.zeros_like(rho_q)
 
-        launch_mrl_grad(q, d, dims_t, a_inv, b_inv, pos, div, w_vec,
+        launch_mrl_grad(q, d, dims, dims_t, a_inv, b_inv, pos, div, w_vec,
                         dQ, dQ if lit else dD, rho_q, rho_q if lit else rho_d,
                         inv_temperature, margin, grad_scale,
                         two_sided=not lit)
         if ctx.use_qq:
-            launch_mrl_grad(q, q, dims_t, a_inv, a_inv, pos, div, w_vec,
+            launch_mrl_grad(q, q, dims, dims_t, a_inv, a_inv, pos, div, w_vec,
                             dQ, dQ, rho_q, rho_q,
                             inv_temperature, margin, grad_scale,
                             exclude_diag=True, two_sided=True)
         if ctx.use_dd:
-            launch_mrl_grad(d, d, dims_t, b_inv, b_inv, pos, div, w_vec,
+            launch_mrl_grad(d, d, dims, dims_t, b_inv, b_inv, pos, div, w_vec,
                             dD, dD, rho_d, rho_d,
                             inv_temperature, margin, grad_scale,
                             exclude_diag=True, two_sided=True)

@@ -200,7 +200,7 @@ def run_world1_fallbacks():
         ref = reference_clip(xr, yr, tau_plus=tau_plus, label_smoothing=ls)
         ref.backward()
         loss_fn = DistributedMemoryEfficientCLIPLoss(
-            temperature=TAU, normalized_inputs=True,
+            temperature=TAU, normalized_inputs=True, stable=False,
             tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
         xk = x.detach().requires_grad_(True)
         yk = y.detach().requires_grad_(True)
@@ -215,7 +215,7 @@ def run_world1_fallbacks():
         ref = reference_lit(xr, y, tau_plus=tau_plus, label_smoothing=ls)
         ref.backward()
         loss_fn = DistributedMemoryEfficientLiTLoss(
-            temperature=TAU, normalized_inputs=True,
+            temperature=TAU, normalized_inputs=True, stable=False,
             tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
         xk = x.detach().requires_grad_(True)
         loss = loss_fn(xk, y, tau_plus=tau_plus if per_row else None)
@@ -273,7 +273,7 @@ def run_distributed():
         ref.backward()
 
         loss_fn = DistributedMemoryEfficientLiTLoss(
-            temperature=TAU, normalized_inputs=True,
+            temperature=TAU, normalized_inputs=True, stable=False,
             tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
         xs = x[rows].detach().requires_grad_(True)
         ys = y[rows].detach().requires_grad_(True)

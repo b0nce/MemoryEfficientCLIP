@@ -130,8 +130,8 @@ def run_fused_lit():
 
             loss_fn = MemoryEfficientMatryoshkaLiTQwen3Loss(
                 dims, temperature=TAU, margin=MARGIN, use_qq_negatives=use_qq,
-                normalized_inputs=True, tau_plus=0.0 if per_row else tau_plus,
-                label_smoothing=ls)
+                normalized_inputs=True, stable=False,
+                tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
             qk = q.detach().requires_grad_(True)
             loss = loss_fn(qk, d, h, tau_plus=tau_plus if per_row else None)
             loss.backward()
@@ -161,7 +161,7 @@ def run_wrapper():
 
         loss_fn = MatryoshkaLoss(MemoryEfficientQwen3Loss(
             temperature=TAU, margin=MARGIN, use_qq_negatives=use_qq,
-            use_dd_negatives=use_dd, normalized_inputs=False,
+            use_dd_negatives=use_dd, normalized_inputs=False, stable=False,
             tau_plus=tau_plus, label_smoothing=ls), dims)
         qk, dk, hk = leafs(q, d, h)
         loss = loss_fn(qk, dk, hk)
@@ -204,9 +204,15 @@ def run_asserts():
 
 
 if __name__ == "__main__":
+    import memeff.mrl_qwen3_loss as _mrl
+
     torch.backends.cuda.matmul.allow_tf32 = False
     run_asserts()
     run_wrapper()
-    run_fused_clip()
-    run_fused_lit()
+    for force in ("prefix", "telescope"):   # both backward kernels, full matrix
+        _mrl._FORCE_BACKWARD = force
+        print(f"--- fused suites, {force} backward ---")
+        run_fused_clip()
+        run_fused_lit()
+    _mrl._FORCE_BACKWARD = None
     print("ALL OK")
