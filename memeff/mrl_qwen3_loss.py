@@ -5,8 +5,7 @@ Raw prefix dots are cumulative across the kernels' feature chunks, and each
 prefix's re-normalization is a per-row scalar (a_i^k = 1/||x_i[:m_k]||), so the
 denom kernel rescales its running dot tile at every prefix boundary and
 accumulates all K denominators in a single sweep. The backward walks the chunks
-twice with a telescoping coefficient tile (derivation and cost accounting in
-docs/mrl_fused_backward.md): the extra cost over the non-MRL kernels is
+twice with a telescoping coefficient tile: the extra cost over the non-MRL kernels is
 m_{K-1}/D of one matmul pass, and the extra state is O(K * batch) scalar tables
 (inverse prefix norms, per-dim positives/divisors, renormalization row sums) --
 no per-dim feature copies, no per-dim gradient buffers.
@@ -164,8 +163,7 @@ def mrl_qwen3_grad_kernel(
     BLOCK_SIZE_D: tl.constexpr, D_MODEL: tl.constexpr,
     INPUT_PRECISION: tl.constexpr,
 ):
-    """Two chunk walks with a telescoping coefficient tile (see
-    docs/mrl_fused_backward.md).
+    """Two chunk walks with a telescoping coefficient tile.
 
     Walk 1 re-accumulates the prefix dots exactly as the denom kernel did and
     folds every boundary's softmax weights into per-pair scalar coefficients

@@ -133,11 +133,11 @@ loss_fn = MemoryEfficientMatryoshkaQwen3Loss(
     temperature=0.05, stable=True, tau_plus=1e-4)
 ```
 
-The fused kernels exploit two facts: raw prefix dots are cumulative across feature chunks, and prefix re-normalization is a per-row scalar — so the forward snapshots every dim's denominator in one sweep, and the backward telescopes a per-pair coefficient tile through two chunk walks (full derivation and cost accounting in `docs/mrl_fused_backward.md`). All options (`margin`, `stable`, `tau_plus` incl. per-row, `label_smoothing`, hard negatives, q-q/d-d) compose per dim.
+The fused kernels exploit two facts: raw prefix dots are cumulative across feature chunks, and prefix re-normalization is a per-row scalar — so the forward snapshots every dim's denominator in one sweep, and the backward telescopes a per-pair coefficient tile through two chunk walks. All options (`margin`, `stable`, `tau_plus` incl. per-row, `label_smoothing`, hard negatives, q-q/d-d) compose per dim.
 
 Honest numbers (A100-PCIE-40GB, bf16, B=65536, D=384, dims 64/128/256/384, fwd+bwd): plain loss 505 ms, fused MRL 1046 ms, eager wrapper 1148 ms. The fused advantage over the wrapper is modest at this D/K ratio — the K per-boundary passes cost O(B²) exp2/atomic work each, which the matmul-only cost model ignores — and grows with `d_model / (64 * K)`. Memory: the fused loss adds only O(K·batch) scalars to the loss state (the bench peaks are dominated by the fp32 gradient buffers, identical asymptotics to the non-MRL losses).
 
-Against the naive dense implementation (materialize the B×B similarity per dim, torch autograd; same loss semantics — `bench_mrl_naive.py`, same GPU/config, loss-only peaks):
+Against the naive dense implementation (materialize the B×B similarity per dim, torch autograd; same loss semantics, same GPU/config, loss-only peaks):
 
 | batch | naive ms / GiB | fused ms / GiB | wrapper ms / GiB |
 |---|---|---|---|
@@ -217,7 +217,7 @@ Note: `label_smoothing` and `tau_plus` push in related directions (both address 
 </details>
 
 <details>
-<summary><b>Tests and benchmarks</b></summary>
+<summary><b>Tests</b></summary>
 
 Both test scripts compare losses and all gradients against dense autograd references (they need a CUDA GPU) and cover the `stable`, `tau_plus` (scalar and per-row), and `label_smoothing` variants and their combinations:
 
@@ -230,8 +230,6 @@ torchrun --nproc-per-node=2 test_qwen3_loss.py
 ```
 
 The kernels run with ieee fp32 matmuls in the tests (`MEMEFF_INPUT_PRECISION=ieee`) so the comparison is not drowned in tensor-core rounding noise; production runs default to tf32.
-
-`bench_qwen3_loss.py` reports timings and peak memory and exports torch.profiler traces to `./traces/`.
 
 </details>
 

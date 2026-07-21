@@ -1,12 +1,14 @@
 # Scratch / experimental temp work (not for version control)
 scratch/
 
-# Local benchmark / remote-run artifacts
+# Local benchmark / remote-run artifacts, working notes
 traces/
 remote_logs/
 results/
 results.tar.gz
 run_remote.sh
+bench_*.py
+docs/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
