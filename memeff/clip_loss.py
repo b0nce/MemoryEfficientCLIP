@@ -3,7 +3,7 @@
 Reuses the block-wise kernels from distributed_clip_loss.py with the whole batch as
 one block: a fused sum-exp pass accumulates the row/column denominators without
 materializing the B x B similarity matrix. The backward is FlashAttention-shaped
-whenever the feature dimension allows it (d_model <= 512): each program owns a
+whenever the feature dimension allows it (d_model <= 1024): each program owns a
 block of output rows, streams every opposite-tower block, and accumulates its
 gradient rows in a (BLOCK, d_model) fp32 register tile written out exactly once
 -- no atomics (measured 47% of the tile-grid backward's time at batch 64k) and no
@@ -89,14 +89,16 @@ def clip_fa_grad_kernel(
 # register accumulator per program: the row block shrinks as d_model grows to
 # hold the accumulator at 128 KB (half the sm80/sm90 register file). Above
 # the cap the atomic tile-grid backward takes over. _FORCE_FA: None -> auto;
-# True/False forces (test hook). d_model > 512 entries are wired but not yet
-# benchmarked, hence the conservative cap.
-_FA_MAX_DMODEL = 512
+# True/False forces (test hook). BLOCK_J is SMEM-bound: the pipeliner stages
+# at least 2 j-blocks regardless of num_stages, so stages * block_j * d_pow2
+# * 2 bytes must fit ~164 KB. At 2048 the surviving (16, 16) config measured
+# 2.5x SLOWER than the atomic fallback (A100, 16k batch) -- dots too thin --
+# hence the cap at 1024.
+_FA_MAX_DMODEL = 1024
 _FORCE_FA = None
 _FA_BLOCKS = {                # d_pow2 -> block_i, block_j, num_warps, num_stages
-    512: (64, 64, 8, 2),      # serves every d_model <= 512 (padded lanes)
-    1024: (32, 64, 8, 2),
-    2048: (16, 64, 8, 2),
+    512: (64, 64, 8, 2),      # serves every d_model <= 512; 3.2x vs atomic @65k
+    1024: (32, 32, 8, 2),     # 1.3x @768, 1.6x @1024 vs atomic (32k batch)
 }
 
 
