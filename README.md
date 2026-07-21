@@ -34,6 +34,9 @@ All losses come in a single-GPU and a `Distributed*` (multi-GPU DDP) variant:
 | LiT (locked image tower) | `MemoryEfficientLiTLoss` | `DistributedMemoryEfficientLiTLoss` |
 | Qwen3 InfoNCE (both towers) | `MemoryEfficientQwen3Loss` | `DistributedMemoryEfficientQwen3Loss` |
 | Qwen3 InfoNCE (locked docs) | `MemoryEfficientLiTQwen3Loss` | `DistributedMemoryEfficientLiTQwen3Loss` |
+| Matryoshka Qwen3 (fused, both towers) | `MemoryEfficientMatryoshkaQwen3Loss` | wrap with `MatryoshkaLoss` |
+| Matryoshka Qwen3 (fused, locked docs) | `MemoryEfficientMatryoshkaLiTQwen3Loss` | wrap with `MatryoshkaLoss` |
+| Matryoshka, any loss above (eager) | `MatryoshkaLoss(base_loss, dims)` | same wrapper |
 
 ## Options (all modules)
 
@@ -102,6 +105,39 @@ dist.all_reduce(global_loss)   # logging only
 ```
 
 Peak memory: the distributed CLIP and Qwen3 losses keep the assembled travelling tower(s) for the backward — O(global_batch × dim) per rank. The distributed LiT losses re-stream the ring in backward instead, staying at O(local_batch × dim). The full B×B similarity matrix is never materialized anywhere; communication is O(batch) against O(batch²) compute.
+
+</details>
+
+<details>
+<summary><b>Matryoshka representation learning (MRL)</b></summary>
+
+Nested-prefix training ([Kusupati et al., 2022](https://arxiv.org/abs/2205.13147)): each prefix `x[..., :m]` is re-normalized and trained with its own full contrastive loss, so at inference the embedding can be truncated to any of the trained dims.
+
+Two implementations:
+
+```python
+from memeff import (MatryoshkaLoss, MemoryEfficientQwen3Loss,
+                    MemoryEfficientMatryoshkaQwen3Loss)
+
+# 1) Eager wrapper: works with EVERY memeff loss (incl. the DDP variants),
+#    any kernel-legal dims. K separate loss passes.
+loss_fn = MatryoshkaLoss(MemoryEfficientQwen3Loss(temperature=0.05),
+                         dims=(64, 128, 256, 384))
+
+# 2) Fused (Qwen3 family, single GPU): all K dims in one pass over the
+#    similarity blocks. Extra state is O(K * batch) scalar tables -- no
+#    per-dim feature copies, no per-dim gradient buffers.
+loss_fn = MemoryEfficientMatryoshkaQwen3Loss(
+    dims=(64, 128, 256, 384),   # strictly increasing, multiples of 64,
+    weights=None,               # ending exactly at d_model (else ValueError)
+    temperature=0.05, stable=True, tau_plus=1e-4)
+```
+
+The fused kernels exploit two facts: raw prefix dots are cumulative across feature chunks, and prefix re-normalization is a per-row scalar — so the forward snapshots every dim's denominator in one sweep, and the backward telescopes a per-pair coefficient tile through two chunk walks (full derivation and cost accounting in `docs/mrl_fused_backward.md`). All options (`margin`, `stable`, `tau_plus` incl. per-row, `label_smoothing`, hard negatives, q-q/d-d) compose per dim.
+
+Honest numbers (A100-PCIE-40GB, bf16, B=65536, D=384, dims 64/128/256/384, fwd+bwd): plain loss 505 ms, fused MRL 1046 ms, eager wrapper 1148 ms. The fused advantage over the wrapper is modest at this D/K ratio — the K per-boundary passes cost O(B²) exp2/atomic work each, which the matmul-only cost model ignores — and grows with `d_model / (64 * K)`. Memory: the fused loss adds only O(K·batch) scalars to the loss state (the bench peaks are dominated by the fp32 gradient buffers, identical asymptotics to the non-MRL losses).
+
+Validated against the per-dim dense reference across the full feature matrix in fp32 (≤1e-4, mostly ≤1e-6) and bf16 (≤6e-3): `python test_mrl_qwen3_loss.py`.
 
 </details>
 
@@ -177,6 +213,7 @@ Both test scripts compare losses and all gradients against dense autograd refere
 ```bash
 python test_clip_lit_loss.py                        # CLIP + LiT, single GPU
 python test_qwen3_loss.py                           # Qwen3, single GPU
+python test_mrl_qwen3_loss.py                       # matryoshka (wrapper + fused)
 torchrun --nproc-per-node=2 test_clip_lit_loss.py   # distributed variants
 torchrun --nproc-per-node=2 test_qwen3_loss.py
 ```

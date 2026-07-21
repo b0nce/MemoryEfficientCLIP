@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "memeff"
-version = "0.1.0"
+version = "0.2.0"
 description = "Memory-efficient contrastive losses (CLIP, LiT, Qwen3-Embedding InfoNCE) with Triton kernels"
 readme = "README.md"
 license = { text = "Apache-2.0" }
