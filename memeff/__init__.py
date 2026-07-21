@@ -16,6 +16,8 @@ from .lit_qwen3_loss import (
 from .matryoshka import MatryoshkaLoss
 from .mrl_qwen3_loss import (
     MemoryEfficientMatryoshkaQwen3Loss, MemoryEfficientMatryoshkaLiTQwen3Loss)
+from .mrl_clip_loss import (
+    MemoryEfficientMatryoshkaCLIPLoss, MemoryEfficientMatryoshkaLiTLoss)
 
 __all__ = [
     "MemoryEfficientCLIPLoss",
@@ -31,4 +33,6 @@ __all__ = [
     "MatryoshkaLoss",
     "MemoryEfficientMatryoshkaQwen3Loss",
     "MemoryEfficientMatryoshkaLiTQwen3Loss",
+    "MemoryEfficientMatryoshkaCLIPLoss",
+    "MemoryEfficientMatryoshkaLiTLoss",
 ]
