@@ -53,7 +53,7 @@ class MemoryEfficientLiTLossNormed(torch.autograd.Function):
         else:
             (x_text, y_img, div), seed = ctx.saved_tensors, None
         # seed with the positive-pair term, the kernel adds the p-weighted sums.
-        if _fa_ok(x_text.shape[1]):
+        if _fa_ok(x_text.shape[1], x_text.device):
             dX = _fa_backward_one(x_text, y_img, div, None, ctx.inv_temperature,
                                   ctx.scale, bidir=False)
             if seed is None:

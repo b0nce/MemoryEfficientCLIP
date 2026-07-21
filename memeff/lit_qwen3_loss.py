@@ -6,7 +6,10 @@ optional q-q negatives as clip_qwen3_loss.py, but documents and hard negatives
 receive no gradient. There is no d-d option: with locked documents its repulsion
 gradient has nowhere to land, it only inflates the denominator. The backward emits
 dQ only, so the DDP version needs no gradient communication unless q-q is enabled.
-Includes single-GPU and DDP modules.
+The single-GPU backward is FlashAttention-shaped for d_model within the cap in
+_common.py (register-tile accumulation, no gradient atomics); larger d_model and
+the DDP module use the atomic tile-grid kernel. Includes single-GPU and DDP
+modules.
 """
 import math
 import torch
@@ -18,8 +21,10 @@ from ._common import (
     LN2 as _LN2,
     LOG2E as _LOG2E,
     debias_denominators as _debias_denominators,
+    fa_ok as _fa_ok,
     hard_negative_exp as _hard_negative_exp,
     launch_qwen3_denom as _launch_denom,
+    launch_qwen3_fa_grad as _launch_fa_grad,
     launch_qwen3_grad as _launch_grad,
     qwen3_assemble_ring as _assemble_ring,
     qwen3_num_negatives as _num_negatives,
@@ -31,6 +36,10 @@ from ._common import (
     validate_tau_plus as _validate_tau_plus,
     world_and_rank as _world_and_rank,
 )
+
+# None -> auto (fa_ok picks the FlashAttention-shaped backward for
+# d_model <= the cap in _common.py); True/False forces it (test hook).
+_FORCE_FA = None
 
 
 class MemoryEfficientLiTQwen3LossNormed(torch.autograd.Function):
@@ -78,11 +87,21 @@ class MemoryEfficientLiTQwen3LossNormed(torch.autograd.Function):
 
         coeff = -grad_scale if seed is None else (seed * grad_scale)[:, None]
         dQ = d.float() * coeff
-        _launch_grad(q, d, pos, div, dQ, dQ, inv_temperature, margin, grad_scale,
-                     two_sided=False)
-        if ctx.use_qq:
-            _launch_grad(q, q, pos, div, dQ, dQ, inv_temperature, margin, grad_scale,
-                         exclude_diag=True, two_sided=True)
+        use_fa = _FORCE_FA if _FORCE_FA is not None else _fa_ok(q.shape[1], q.device)
+        if use_fa:
+            _launch_fa_grad(q, d, pos, div, dQ, inv_temperature, margin,
+                            grad_scale, row_side=True, col_side=False,
+                            exclude_diag=False)
+            if ctx.use_qq:
+                _launch_fa_grad(q, q, pos, div, dQ, inv_temperature, margin,
+                                grad_scale, row_side=True, col_side=True,
+                                exclude_diag=True)
+        else:
+            _launch_grad(q, d, pos, div, dQ, dQ, inv_temperature, margin, grad_scale,
+                         two_sided=False)
+            if ctx.use_qq:
+                _launch_grad(q, q, pos, div, dQ, dQ, inv_temperature, margin, grad_scale,
+                             exclude_diag=True, two_sided=True)
         if h is not None:
             p_h = _hard_negative_exp(q, h, pos, inv_temperature, margin) / div[:, None]
             dQ += grad_scale * torch.einsum('bk,bkd->bd', p_h, h.float())

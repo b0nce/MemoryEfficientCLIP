@@ -36,6 +36,48 @@ def backward_blocks(device):
     return _BACKWARD_BLOCKS.get(cap[0] * 10 + cap[1], _DEFAULT_BLOCKS)
 
 
+# FlashAttention-shaped backward configs, shared by the CLIP/LiT and Qwen3
+# losses. Each program holds a (BLOCK_I, next_pow2(d_model)) fp32 register
+# accumulator, so the row block shrinks as d_model grows to keep it at 128 KB
+# (half the 256 KB register file, same on sm80/sm90). BLOCK_J is bounded by
+# shared memory: the pipeliner stages at least 2 j-blocks regardless of
+# num_stages, so 2 * block_j * d_pow2 * 2 bytes must fit (~164 KB on sm80).
+# Above the cap the atomic tile-grid kernels take over (at 2048 the register
+# budget forces blocks too thin to beat them on every measured arch).
+FA_MAX_DMODEL = 1024
+_FA_MAX_BY_CAP = {
+    # B200's tensor cores are ~2x faster against the same 256 KB register
+    # file, so above 512 lanes the register-bound FA shapes cannot feed them:
+    # the best 1024-lane config measured 1.24x SLOWER than the atomic kernel
+    # (and 768 1.6x slower) where sm80/sm90 win. At 512 FA still wins 3.3x.
+    100: 512,
+}
+_FA_BLOCKS = {                # d_pow2 -> block_i, block_j, num_warps, num_stages
+    512: (64, 64, 8, 2),      # serves every d_model <= 512; 3.2x vs atomic @65k
+    1024: (32, 32, 8, 2),     # 1.3x @768, 1.6x @1024 vs atomic (32k batch)
+}
+_FA_BLOCKS_BY_CAP = {         # cap -> {d_pow2: config} overrides, tuned per arch
+    # H100's 228 KB SMEM fits the 64-wide j-block at d_pow2 1024 (sm80 OORs);
+    # measured 1.3x @768 / 1.6x @1024 vs atomic where the sm80 32-wide config
+    # only broke even. 512 keeps the sm80 config (2.6x); 2048 still loses to
+    # the atomic kernel (3.4x slower) so the cap stays.
+    90: {1024: (32, 64, 8, 2)},
+}
+
+
+def fa_ok(d_model, device):
+    cap = torch.cuda.get_device_capability(device)
+    cap_max = _FA_MAX_BY_CAP.get(cap[0] * 10 + cap[1], FA_MAX_DMODEL)
+    return triton.next_power_of_2(d_model) <= cap_max
+
+
+def fa_blocks(device, d_model):
+    d_pow2 = max(512, triton.next_power_of_2(d_model))
+    cap = torch.cuda.get_device_capability(device)
+    table = _FA_BLOCKS_BY_CAP.get(cap[0] * 10 + cap[1], {})
+    return table.get(d_pow2, _FA_BLOCKS[d_pow2])
+
+
 def world_and_rank(group):
     if dist.is_available() and dist.is_initialized():
         return dist.get_world_size(group), dist.get_rank(group)
@@ -346,6 +388,81 @@ def launch_qwen3_grad(a, b, pos, sum_exp_row, dA, dB, inv_temperature, margin, g
         D_MODEL=d_model, INPUT_PRECISION=INPUT_PRECISION,
         num_warps=num_warps, num_stages=num_stages,
     )
+
+
+@triton.jit
+def qwen3_fa_grad_kernel(
+    A_ptr, B_ptr, pos_ptr, div_ptr, dA_ptr,
+    inv_temperature, margin, grad_scale, n_own, n_other,
+    ROW_SIDE: tl.constexpr, COL_SIDE: tl.constexpr, EXCLUDE_DIAG: tl.constexpr,
+    BLOCK_SIZE_I: tl.constexpr, BLOCK_SIZE_J: tl.constexpr,
+    D_POW2: tl.constexpr, D_MODEL: tl.constexpr, INPUT_PRECISION: tl.constexpr,
+):
+    """FlashAttention-shaped Qwen3 gradient (single GPU): the program owns rows
+    [pid * BLOCK_I, ...) of A, streams every B block and accumulates
+    dA += sum_j prob_ij * B_j into the (pre-seeded) dA rows -- no atomics, one
+    read-modify-write per owned row. Rows and columns index the same batch, so
+    one pos/div vector serves both roles: ROW_SIDE adds the own-row softmax
+    term (pos/div at the owned rows), COL_SIDE the transposed-role term
+    (pos/div at the streamed rows); the self-similarity blocks (q-q / d-d)
+    enable both plus EXCLUDE_DIAG. The false-negative mask and the diagonal
+    exclusion multiply by 0/1 floats -- tl.where here trips the triton 3.1
+    select-layout bug -- and the 1D pos/div loads use clamped indices for the
+    same reason (out-of-range B rows load as zero features, so their finite
+    prob contributes nothing through the accumulation dot)."""
+    pid = tl.program_id(0)
+    i_offsets = pid * BLOCK_SIZE_I + tl.arange(0, BLOCK_SIZE_I)
+    d_offsets = tl.arange(0, D_POW2)
+    i_mask = i_offsets < n_own
+    d_mask = d_offsets < D_MODEL
+    out_offsets = i_offsets[:, None] * D_MODEL + d_offsets[None, :]
+    out_mask = i_mask[:, None] & d_mask[None, :]
+
+    A_own = tl.load(A_ptr + out_offsets, mask=out_mask, other=0.0)
+    if ROW_SIDE:
+        pos_own = tl.load(pos_ptr + tl.minimum(i_offsets, n_own - 1))
+        div_own = tl.load(div_ptr + tl.minimum(i_offsets, n_own - 1))
+    acc = tl.zeros([BLOCK_SIZE_I, D_POW2], dtype=tl.float32)
+
+    for j_start in range(0, n_other, BLOCK_SIZE_J):
+        j_offsets = j_start + tl.arange(0, BLOCK_SIZE_J)
+        B_block = tl.load(B_ptr + (j_offsets[:, None] * D_MODEL + d_offsets[None, :]),
+                          mask=((j_offsets[:, None] < n_other) & d_mask[None, :]),
+                          other=0.0)
+        S = tl.dot(A_own, tl.trans(B_block), input_precision=INPUT_PRECISION)
+        exp_S = tl.exp2(S * inv_temperature - inv_temperature)
+        prob = tl.zeros([BLOCK_SIZE_I, BLOCK_SIZE_J], dtype=tl.float32)
+        if ROW_SIDE:
+            keep = (S <= pos_own[:, None] + margin).to(tl.float32)
+            prob += tl.math.fdiv(exp_S, div_own[:, None]) * keep
+        if COL_SIDE:
+            pos_other = tl.load(pos_ptr + tl.minimum(j_offsets, n_other - 1))
+            div_other = tl.load(div_ptr + tl.minimum(j_offsets, n_other - 1))
+            keep = (S <= pos_other[None, :] + margin).to(tl.float32)
+            prob += tl.math.fdiv(exp_S, div_other[None, :]) * keep
+        if EXCLUDE_DIAG:
+            prob *= (i_offsets[:, None] != j_offsets[None, :]).to(tl.float32)
+        prob_low = (prob * grad_scale).to(A_ptr.dtype.element_ty)
+        acc = tl.dot(prob_low, B_block, acc, input_precision=INPUT_PRECISION)
+
+    acc += tl.load(dA_ptr + out_offsets, mask=out_mask, other=0.0)
+    tl.store(dA_ptr + out_offsets, acc, mask=out_mask)
+
+
+def launch_qwen3_fa_grad(a, b, pos, div, dA, inv_temperature, margin, grad_scale,
+                         *, row_side, col_side, exclude_diag):
+    """One tower's gradient rows accumulated into the pre-seeded fp32 dA."""
+    n_own, d_model = a.shape
+    block_i, block_j, num_warps, num_stages = fa_blocks(a.device, d_model)
+    grid = (triton.cdiv(n_own, block_i),)
+    qwen3_fa_grad_kernel[grid](
+        a, b, pos, div, dA, inv_temperature, margin, grad_scale,
+        n_own, b.shape[0],
+        ROW_SIDE=row_side, COL_SIDE=col_side, EXCLUDE_DIAG=exclude_diag,
+        BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j,
+        D_POW2=triton.next_power_of_2(d_model), D_MODEL=d_model,
+        INPUT_PRECISION=INPUT_PRECISION, num_warps=num_warps,
+        num_stages=num_stages)
 
 
 def qwen3_assemble_ring(q_local, d_local, pos, inv_temperature, margin,

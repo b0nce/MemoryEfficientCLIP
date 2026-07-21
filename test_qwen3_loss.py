@@ -361,7 +361,13 @@ if __name__ == "__main__":
     if int(os.environ.get("WORLD_SIZE", "1")) > 1:
         run_distributed()
     else:
-        run_single_clip()
-        run_single_lit()
+        import memeff.clip_qwen3_loss as _cq
+        import memeff.lit_qwen3_loss as _lq
+        for force in (False, True):
+            _cq._FORCE_FA = _lq._FORCE_FA = force
+            print(f"=== backward: {'FA' if force else 'atomic tile-grid'} ===")
+            run_single_clip()
+            run_single_lit()
+        _cq._FORCE_FA = _lq._FORCE_FA = None
         run_world1_fallbacks()
         print("ALL OK")

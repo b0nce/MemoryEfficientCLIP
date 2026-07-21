@@ -5,7 +5,11 @@ Asymmetric query->document InfoNCE with a false-negative mask (negatives whose
 similarity exceeds s(q_i, d_i) + margin are dropped), optional row-specific hard
 negatives (batch, K, dim) and optional q-q / d-d in-batch negatives. The softmax is
 row-only, so every negative group adds into the same per-row fp32 denominator and
-the same kernel pair covers all passes. Includes single-GPU and DDP modules.
+the same kernel pair covers all passes. The single-GPU backward is
+FlashAttention-shaped for d_model within the cap in _common.py (register-tile
+accumulation, no gradient atomics; one launch per output x similarity block);
+larger d_model and the DDP module use the atomic tile-grid kernel. Includes
+single-GPU and DDP modules.
 """
 import math
 import torch
@@ -17,8 +21,10 @@ from ._common import (
     LN2 as _LN2,
     LOG2E as _LOG2E,
     debias_denominators as _debias_denominators,
+    fa_ok as _fa_ok,
     hard_negative_exp as _hard_negative_exp,
     launch_qwen3_denom as _launch_denom,
+    launch_qwen3_fa_grad as _launch_fa_grad,
     launch_qwen3_grad as _launch_grad,
     qwen3_assemble_ring as _assemble_ring,
     qwen3_num_negatives as _num_negatives,
@@ -30,6 +36,10 @@ from ._common import (
     validate_tau_plus as _validate_tau_plus,
     world_and_rank as _world_and_rank,
 )
+
+# None -> auto (fa_ok picks the FlashAttention-shaped backward for
+# d_model <= the cap in _common.py); True/False forces it (test hook).
+_FORCE_FA = None
 
 
 class MemoryEfficientQwen3LossNormed(torch.autograd.Function):
@@ -81,14 +91,35 @@ class MemoryEfficientQwen3LossNormed(torch.autograd.Function):
         coeff = -grad_scale if seed is None else (seed * grad_scale)[:, None]
         dQ = d.float() * coeff
         dD = q.float() * coeff
-        _launch_grad(q, d, pos, div, dQ, dD, inv_temperature, margin, grad_scale,
-                     two_sided=True)
-        if ctx.use_qq:
-            _launch_grad(q, q, pos, div, dQ, dQ, inv_temperature, margin, grad_scale,
-                         exclude_diag=True, two_sided=True)
-        if ctx.use_dd:
-            _launch_grad(d, d, pos, div, dD, dD, inv_temperature, margin, grad_scale,
-                         exclude_diag=True, two_sided=True)
+        use_fa = _FORCE_FA if _FORCE_FA is not None else _fa_ok(q.shape[1], q.device)
+        if use_fa:
+            # One FA launch per output x similarity block: the row side of q-d
+            # goes to dQ, its column side to dD (each recomputing S, the
+            # FlashAttention-2 dQ vs dK/dV trade); the self-blocks contribute
+            # both sides to their own tower.
+            _launch_fa_grad(q, d, pos, div, dQ, inv_temperature, margin,
+                            grad_scale, row_side=True, col_side=False,
+                            exclude_diag=False)
+            if ctx.use_qq:
+                _launch_fa_grad(q, q, pos, div, dQ, inv_temperature, margin,
+                                grad_scale, row_side=True, col_side=True,
+                                exclude_diag=True)
+            _launch_fa_grad(d, q, pos, div, dD, inv_temperature, margin,
+                            grad_scale, row_side=False, col_side=True,
+                            exclude_diag=False)
+            if ctx.use_dd:
+                _launch_fa_grad(d, d, pos, div, dD, inv_temperature, margin,
+                                grad_scale, row_side=True, col_side=True,
+                                exclude_diag=True)
+        else:
+            _launch_grad(q, d, pos, div, dQ, dD, inv_temperature, margin, grad_scale,
+                         two_sided=True)
+            if ctx.use_qq:
+                _launch_grad(q, q, pos, div, dQ, dQ, inv_temperature, margin, grad_scale,
+                             exclude_diag=True, two_sided=True)
+            if ctx.use_dd:
+                _launch_grad(d, d, pos, div, dD, dD, inv_temperature, margin, grad_scale,
+                             exclude_diag=True, two_sided=True)
 
         dH = None
         if h is not None:

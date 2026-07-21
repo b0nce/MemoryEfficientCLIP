@@ -23,6 +23,7 @@ import triton.language as tl
 from ._common import (INPUT_PRECISION as _INPUT_PRECISION, LOG2E as _LOG2E,
                       clip_smoothing_term as _clip_smoothing_term,
                       debias_denominators as _debias_denominators,
+                      fa_blocks as _fa_blocks, fa_ok,
                       resolve_tau_plus as _resolve_tau_plus,
                       validate_features as _validate_features,
                       validate_label_smoothing as _validate_label_smoothing,
@@ -85,25 +86,10 @@ def clip_fa_grad_kernel(
              mask=(i_mask[:, None] & d_mask[None, :]))
 
 
-# FlashAttention-style backward needs a (BLOCK_I, next_pow2(d_model)) fp32
-# register accumulator per program: the row block shrinks as d_model grows to
-# hold the accumulator at 128 KB (half the sm80/sm90 register file). Above
-# the cap the atomic tile-grid backward takes over. _FORCE_FA: None -> auto;
-# True/False forces (test hook). BLOCK_J is SMEM-bound: the pipeliner stages
-# at least 2 j-blocks regardless of num_stages, so stages * block_j * d_pow2
-# * 2 bytes must fit ~164 KB. At 2048 the surviving (16, 16) config measured
-# 2.5x SLOWER than the atomic fallback (A100, 16k batch) -- dots too thin --
-# hence the cap at 1024.
-_FA_MAX_DMODEL = 1024
+# The FA block table and cap live in _common.py (shared with the Qwen3
+# losses, keyed by compute capability). _FORCE_FA: None -> auto (fa_ok);
+# True/False forces the FA / atomic backward (test hook).
 _FORCE_FA = None
-_FA_BLOCKS = {                # d_pow2 -> block_i, block_j, num_warps, num_stages
-    512: (64, 64, 8, 2),      # serves every d_model <= 512; 3.2x vs atomic @65k
-    1024: (32, 32, 8, 2),     # 1.3x @768, 1.6x @1024 vs atomic (32k batch)
-}
-
-
-def fa_ok(d_model):
-    return triton.next_power_of_2(d_model) <= _FA_MAX_DMODEL
 
 
 def fa_backward_one(a, b, div_own, div_other, inv_temperature, grad_scale,
@@ -111,8 +97,7 @@ def fa_backward_one(a, b, div_own, div_other, inv_temperature, grad_scale,
     """One tower's gradient rows via the FlashAttention-shaped kernel.
     div_other is ignored when bidir is False (LiT: row softmax only)."""
     n_own, d_model = a.shape
-    block_i, block_j, num_warps, num_stages = _FA_BLOCKS[
-        max(512, triton.next_power_of_2(d_model))]
+    block_i, block_j, num_warps, num_stages = _fa_blocks(a.device, d_model)
     dA = torch.empty(n_own, d_model, device=a.device, dtype=torch.float32)
     grid = (triton.cdiv(n_own, block_i),)
     clip_fa_grad_kernel[grid](
@@ -168,7 +153,7 @@ class MemoryEfficientCLIPLossNormed(torch.autograd.Function):
         else:
             (x, y, div_row, div_col), seed = ctx.saved_tensors, None
         batch_size = ctx.batch_size
-        use_fa = _FORCE_FA if _FORCE_FA is not None else fa_ok(x.shape[1])
+        use_fa = _FORCE_FA if _FORCE_FA is not None else fa_ok(x.shape[1], x.device)
         if use_fa:
             dX, dY = _fa_backward(x, y, div_row, div_col, ctx.inv_temperature,
                                   ctx.inv_temperature_orig / (2.0 * batch_size))
