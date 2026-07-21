@@ -85,13 +85,19 @@ def clip_fa_grad_kernel(
              mask=(i_mask[:, None] & d_mask[None, :]))
 
 
-# FlashAttention-style backward needs a (BLOCK, next_pow2(d_model)) fp32
-# register accumulator per program; above this d_model it stops fitting and
-# the atomic tile-grid backward takes over. None -> auto; True/False forces
-# (test hook).
+# FlashAttention-style backward needs a (BLOCK_I, next_pow2(d_model)) fp32
+# register accumulator per program: the row block shrinks as d_model grows to
+# hold the accumulator at 128 KB (half the sm80/sm90 register file). Above
+# the cap the atomic tile-grid backward takes over. _FORCE_FA: None -> auto;
+# True/False forces (test hook). d_model > 512 entries are wired but not yet
+# benchmarked, hence the conservative cap.
 _FA_MAX_DMODEL = 512
 _FORCE_FA = None
-_FA_BLOCKS = (64, 64, 8, 2)   # block_i, block_j, num_warps, num_stages
+_FA_BLOCKS = {                # d_pow2 -> block_i, block_j, num_warps, num_stages
+    512: (64, 64, 8, 2),      # serves every d_model <= 512 (padded lanes)
+    1024: (32, 64, 8, 2),
+    2048: (16, 64, 8, 2),
+}
 
 
 def fa_ok(d_model):
@@ -103,7 +109,8 @@ def fa_backward_one(a, b, div_own, div_other, inv_temperature, grad_scale,
     """One tower's gradient rows via the FlashAttention-shaped kernel.
     div_other is ignored when bidir is False (LiT: row softmax only)."""
     n_own, d_model = a.shape
-    block_i, block_j, num_warps, num_stages = _FA_BLOCKS
+    block_i, block_j, num_warps, num_stages = _FA_BLOCKS[
+        max(512, triton.next_power_of_2(d_model))]
     dA = torch.empty(n_own, d_model, device=a.device, dtype=torch.float32)
     grid = (triton.cdiv(n_own, block_i),)
     clip_fa_grad_kernel[grid](
