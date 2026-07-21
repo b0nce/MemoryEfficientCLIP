@@ -19,6 +19,7 @@ from ._common import (LN2 as _LN2, LOG2E as _LOG2E,
                       validate_features as _validate_features,
                       validate_label_smoothing as _validate_label_smoothing,
                       validate_tau_plus as _validate_tau_plus)
+from .clip_loss import fa_backward_one as _fa_backward_one, fa_ok as _fa_ok
 from .distributed_lit_loss import _launch_denom, _launch_grad
 
 
@@ -52,11 +53,19 @@ class MemoryEfficientLiTLossNormed(torch.autograd.Function):
         else:
             (x_text, y_img, div), seed = ctx.saved_tensors, None
         # seed with the positive-pair term, the kernel adds the p-weighted sums.
-        if seed is None:
-            dX = y_img.float() * (-ctx.scale)
+        if _fa_ok(x_text.shape[1]):
+            dX = _fa_backward_one(x_text, y_img, div, None, ctx.inv_temperature,
+                                  ctx.scale, bidir=False)
+            if seed is None:
+                dX -= y_img.float() * ctx.scale
+            else:
+                dX += y_img.float() * (seed * ctx.scale)[:, None]
         else:
-            dX = y_img.float() * (seed * ctx.scale)[:, None]
-        _launch_grad(x_text, y_img, div, ctx.scale, dX, ctx.inv_temperature)
+            if seed is None:
+                dX = y_img.float() * (-ctx.scale)
+            else:
+                dX = y_img.float() * (seed * ctx.scale)[:, None]
+            _launch_grad(x_text, y_img, div, ctx.scale, dX, ctx.inv_temperature)
         dX = dX * grad_output
         return dX.to(ctx.in_dtype), None, None, None, None, None
 
