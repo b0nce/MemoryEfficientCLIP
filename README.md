@@ -137,6 +137,17 @@ The fused kernels exploit two facts: raw prefix dots are cumulative across featu
 
 Honest numbers (A100-PCIE-40GB, bf16, B=65536, D=384, dims 64/128/256/384, fwd+bwd): plain loss 505 ms, fused MRL 1046 ms, eager wrapper 1148 ms. The fused advantage over the wrapper is modest at this D/K ratio — the K per-boundary passes cost O(B²) exp2/atomic work each, which the matmul-only cost model ignores — and grows with `d_model / (64 * K)`. Memory: the fused loss adds only O(K·batch) scalars to the loss state (the bench peaks are dominated by the fp32 gradient buffers, identical asymptotics to the non-MRL losses).
 
+Against the naive dense implementation (materialize the B×B similarity per dim, torch autograd; same loss semantics — `bench_mrl_naive.py`, same GPU/config, loss-only peaks):
+
+| batch | naive ms / GiB | fused ms / GiB | wrapper ms / GiB |
+|---|---|---|---|
+| 4,096 | 9.4 / 0.48 | **6.9** / 0.10 | 9.4 / 0.07 |
+| 8,192 | 30.1 / 1.82 | **14.6** / 0.18 | 16.2 / 0.13 |
+| 16,384 | 90.0 / 7.11 | 63.8 / 0.35 | **63.3** / 0.24 |
+| 32,768 | 354.2 / 28.21 | **262.3** / 0.68 | 275.1 / 0.46 |
+| 65,536 | OOM (>40 GiB) | **1055** / 1.33 | 1146 / 0.89 |
+| 131,072 | OOM (>40 GiB) | **4196** / 2.65 | 4708 / 1.77 |
+
 Validated against the per-dim dense reference across the full feature matrix in fp32 (≤1e-4, mostly ≤1e-6) and bf16 (≤6e-3): `python test_mrl_qwen3_loss.py`.
 
 </details>
