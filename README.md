@@ -34,8 +34,10 @@ All losses come in a single-GPU and a `Distributed*` (multi-GPU DDP) variant:
 | LiT (locked image tower) | `MemoryEfficientLiTLoss` | `DistributedMemoryEfficientLiTLoss` |
 | Qwen3 InfoNCE (both towers) | `MemoryEfficientQwen3Loss` | `DistributedMemoryEfficientQwen3Loss` |
 | Qwen3 InfoNCE (locked docs) | `MemoryEfficientLiTQwen3Loss` | `DistributedMemoryEfficientLiTQwen3Loss` |
-| Matryoshka Qwen3 (fused, both towers) | `MemoryEfficientMatryoshkaQwen3Loss` | wrap with `MatryoshkaLoss` |
-| Matryoshka Qwen3 (fused, locked docs) | `MemoryEfficientMatryoshkaLiTQwen3Loss` | wrap with `MatryoshkaLoss` |
+| Matryoshka CLIP (fused) | `MemoryEfficientMatryoshkaCLIPLoss` | `DistributedMemoryEfficientMatryoshkaCLIPLoss` |
+| Matryoshka LiT (fused) | `MemoryEfficientMatryoshkaLiTLoss` | `DistributedMemoryEfficientMatryoshkaLiTLoss` |
+| Matryoshka Qwen3 (fused, both towers) | `MemoryEfficientMatryoshkaQwen3Loss` | `DistributedMemoryEfficientMatryoshkaQwen3Loss` |
+| Matryoshka Qwen3 (fused, locked docs) | `MemoryEfficientMatryoshkaLiTQwen3Loss` | `DistributedMemoryEfficientMatryoshkaLiTQwen3Loss` |
 | Matryoshka, any loss above (eager) | `MatryoshkaLoss(base_loss, dims)` | same wrapper |
 
 ## Options (all modules)
@@ -124,7 +126,7 @@ from memeff import (MatryoshkaLoss, MemoryEfficientQwen3Loss,
 loss_fn = MatryoshkaLoss(MemoryEfficientQwen3Loss(temperature=0.05),
                          dims=(64, 128, 256, 384))
 
-# 2) Fused (Qwen3 family, single GPU): all K dims in one pass over the
+# 2) Fused (CLIP/LiT/Qwen3 families): all K dims in one pass over the
 #    similarity blocks. Extra state is O(K * batch) scalar tables -- no
 #    per-dim feature copies, no per-dim gradient buffers.
 loss_fn = MemoryEfficientMatryoshkaQwen3Loss(
@@ -132,6 +134,8 @@ loss_fn = MemoryEfficientMatryoshkaQwen3Loss(
     weights=None,               # ending exactly at d_model (else ValueError)
     temperature=0.05, stable=True, tau_plus=1e-4)
 ```
+
+The fused `Distributed*Matryoshka*` variants keep the one-pass property across the DDP ring: the towers travel **once** for all K dims (the wrapper re-runs the whole ring per dim), each hop feeds the fused denominator kernel, and the traveling blocks' prefix-norm tables are recomputed on arrival instead of communicated. Backward is one rectangular launch of the same tile kernels over local rows × global columns, plus the plain losses' reduce-scatter for column gradients and one O(K·batch) all-reduce for the re-normalization correction sums. The distributed MRL LiT losses keep the never-assemble contract: peak memory O(local_batch × dim), no gradient communication.
 
 The fused kernels exploit two facts: raw prefix dots are cumulative across feature chunks, and prefix re-normalization is a per-row scalar — so the forward snapshots every dim's denominator in one sweep, and the backward telescopes a per-pair coefficient tile through two chunk walks. All options (`margin`, `stable`, `tau_plus` incl. per-row, `label_smoothing`, hard negatives, q-q/d-d) compose per dim.
 
@@ -224,6 +228,8 @@ The fused matryoshka backwards use the same FA shape with one launch per prefix 
 
 **Qwen3.** The softmax is row-only, so every negative group ((Q,D), (Q,Q), (D,D)) is another additive contribution to the same per-row fp32 denominator, and one masked kernel pair covers all passes (`qwen3_denom_kernel` / `qwen3_grad_kernel`, with an optional global diagonal exclusion). The mask recomputes identically in backward, so no B×B state is stored. The B×K hard-negative block is handled eagerly in fp32. The DDP variant runs on the same ring as the distributed CLIP loss: row denominators live entirely on the row's home rank, d-d rides the travelling document blocks for free, q-q makes the query tower travel too (doubling ring payload, one extra reduce-scatter), hard negatives never leave their rank.
 
+**Distributed matryoshka.** `distributed_mrl_clip_loss.py` / `distributed_mrl_qwen3_loss.py` contain **no new kernels**: the single-GPU MRL tile kernels already take rectangular grids, separate row/column table strides, and row/column offsets, so the fused DDP variants are pure orchestration — the ring travels once for all K dims, each hop launches the fused denom kernel with that block's locally recomputed prefix-norm table, and the backward is one rectangular launch per similarity block with the plain losses' reduce-scatter plus an O(K·batch) rho all-reduce. The FA-shaped backward stays single-GPU (it wants the whole opposite tower streamed inside one launch).
+
 </details>
 
 <details>
@@ -235,8 +241,11 @@ Both test scripts compare losses and all gradients against dense autograd refere
 python test_clip_lit_loss.py                        # CLIP + LiT, single GPU
 python test_qwen3_loss.py                           # Qwen3, single GPU
 python test_mrl_qwen3_loss.py                       # matryoshka (wrapper + fused)
+python test_mrl_clip_loss.py
 torchrun --nproc-per-node=2 test_clip_lit_loss.py   # distributed variants
 torchrun --nproc-per-node=2 test_qwen3_loss.py
+torchrun --nproc-per-node=2 test_mrl_qwen3_loss.py  # distributed fused matryoshka
+torchrun --nproc-per-node=2 test_mrl_clip_loss.py
 ```
 
 The kernels run with ieee fp32 matmuls in the tests (`MEMEFF_INPUT_PRECISION=ieee`) so the comparison is not drowned in tensor-core rounding noise; production runs default to tf32.

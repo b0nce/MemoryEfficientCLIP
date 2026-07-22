@@ -16,11 +16,14 @@ import os
 os.environ.setdefault("MEMEFF_INPUT_PRECISION", "ieee")   # must precede the imports
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from memeff import (MatryoshkaLoss, MemoryEfficientCLIPLoss,
                     MemoryEfficientMatryoshkaCLIPLoss,
-                    MemoryEfficientMatryoshkaLiTLoss)
+                    MemoryEfficientMatryoshkaLiTLoss,
+                    DistributedMemoryEfficientMatryoshkaCLIPLoss,
+                    DistributedMemoryEfficientMatryoshkaLiTLoss)
 import memeff.mrl_qwen3_loss as _mrl
 from test_clip_lit_loss import (TAU, DIM, check, debias_on, make_inputs,
                                 make_tau_row, reference_clip, reference_lit)
@@ -121,12 +124,139 @@ def run_wrapper():
         check("dY", yk.grad, yr.grad, 1e-3)
 
 
+def run_dist_world1():
+    """The fused distributed modules at world=1 (no process group): every
+    kernel launch and eager term minus the collectives."""
+    for tau_plus, ls in [(0.0, 0.0), (0.3, 0.1), ("row", 0.0)]:
+        per_row = tau_plus == "row"
+        tp = make_tau_row(1024) if per_row else tau_plus
+        w = (1.0,) * len(DIMS3)
+        x, y = make_inputs(1024, torch.float32, pos_dupes=debias_on(tp))
+
+        xr, yr = leafs(x, y, torch.float32)
+        ref = reference_mrl(xr, yr, DIMS3, w, reference_clip,
+                            tau_plus=tp, label_smoothing=ls)
+        ref.backward()
+        loss_fn = DistributedMemoryEfficientMatryoshkaCLIPLoss(
+            DIMS3, temperature=TAU, normalized_inputs=True, stable=False,
+            tau_plus=0.0 if per_row else tp, label_smoothing=ls)
+        xk, yk = leafs(x, y)
+        loss = loss_fn(xk, yk, tau_plus=tp if per_row else None)
+        loss.backward()
+        print(f"mrl-clip dist world=1 tau+={tau_plus} ls={ls}")
+        check("loss", loss.detach(), ref.detach(), 1e-3)
+        check("dX", xk.grad, xr.grad, 1e-3)
+        check("dY", yk.grad, yr.grad, 1e-3)
+
+        xr, _ = leafs(x, y, torch.float32)
+        ref = reference_mrl(xr, y.float(), DIMS3, w, reference_lit,
+                            tau_plus=tp, label_smoothing=ls)
+        ref.backward()
+        lit_fn = DistributedMemoryEfficientMatryoshkaLiTLoss(
+            DIMS3, temperature=TAU, normalized_inputs=True, stable=False,
+            tau_plus=0.0 if per_row else tp, label_smoothing=ls)
+        xk = x.detach().requires_grad_(True)
+        loss = lit_fn(xk, y, tau_plus=tp if per_row else None)
+        loss.backward()
+        print(f"mrl-lit dist world=1 tau+={tau_plus} ls={ls}")
+        check("loss", loss.detach(), ref.detach(), 1e-3)
+        check("dX", xk.grad, xr.grad, 1e-3)
+
+
+def run_distributed():
+    dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    torch.cuda.set_device(rank)
+    local_b = 512
+    B = world * local_b
+    rows = slice(rank * local_b, (rank + 1) * local_b)
+    tol = 1e-3
+
+    for force in ("prefix", "telescope"):   # both tile backends over the ring
+        _mrl._FORCE_BACKWARD = force
+        if rank == 0:
+            print(f"--- mrl distributed suites, {force} backward ---")
+        for dims, weights, stable, tau_label, ls in [
+                (DIMS3, None, False, 0.0, 0.0),
+                (DIMS3, (0.5, 0.3, 0.2), False, 0.0, 0.0),
+                (DIMS2, None, True, 0.0, 0.0),
+                (DIMS3, None, False, 0.3, 0.0),
+                (DIMS3, None, False, "row", 0.0),
+                (DIMS3, None, False, 0.0, 0.1),
+                (DIMS3, None, True, 0.3, 0.1)]:
+            # identical global batch on every rank, each takes its shard
+            w = weights or (1.0,) * len(dims)
+            per_row = tau_label == "row"
+            tau_plus = make_tau_row(B) if per_row else tau_label   # same seed everywhere
+            x, y = make_inputs(B, torch.float32, seed=7, pos_dupes=debias_on(tau_plus))
+            sc = math.sqrt(B * TAU) if stable else 1.0
+
+            xr, yr = leafs(x, y, torch.float32)
+            ref = reference_mrl(xr, yr, dims, w, reference_clip,
+                                tau_plus=tau_plus, label_smoothing=ls)
+            ref.backward()
+            loss_fn = DistributedMemoryEfficientMatryoshkaCLIPLoss(
+                dims, weights=weights, temperature=TAU, normalized_inputs=True,
+                stable=stable, tau_plus=0.0 if per_row else tau_plus,
+                label_smoothing=ls)
+            xs = x[rows].detach().requires_grad_(True)
+            ys = y[rows].detach().requires_grad_(True)
+            partial = loss_fn(xs, ys, tau_plus=tau_plus[rows] if per_row else None)
+            partial.backward()
+            total = partial.detach().clone()
+            dist.all_reduce(total)
+
+            if rank == 0:
+                print(f"mrl-clip dist world={world} dims={dims} "
+                      f"w={'custom' if weights else 'unit'} stable={stable} "
+                      f"tau+={tau_label} ls={ls}")
+            check(f"loss(rank{rank})", total, ref.detach(), tol)
+            check(f"dX(rank{rank})", xs.grad, xr.grad[rows] * sc, tol)
+            check(f"dY(rank{rank})", ys.grad, yr.grad[rows] * sc, tol)
+            dist.barrier()
+
+        for dims, tau_label, ls in [(DIMS3, 0.0, 0.0), (DIMS3, 0.3, 0.0),
+                                    (DIMS3, "row", 0.0), (DIMS2, 0.0, 0.1)]:
+            w = (1.0,) * len(dims)
+            per_row = tau_label == "row"
+            tau_plus = make_tau_row(B) if per_row else tau_label
+            x, y = make_inputs(B, torch.float32, seed=11, pos_dupes=debias_on(tau_plus))
+
+            xr, _ = leafs(x, y, torch.float32)
+            ref = reference_mrl(xr, y.float(), dims, w, reference_lit,
+                                tau_plus=tau_plus, label_smoothing=ls)
+            ref.backward()
+            lit_fn = DistributedMemoryEfficientMatryoshkaLiTLoss(
+                dims, temperature=TAU, normalized_inputs=True, stable=False,
+                tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
+            xs = x[rows].detach().requires_grad_(True)
+            ys = y[rows].detach().requires_grad_(True)
+            partial = lit_fn(xs, ys, tau_plus=tau_plus[rows] if per_row else None)
+            partial.backward()
+            total = partial.detach().clone()
+            dist.all_reduce(total)
+
+            if rank == 0:
+                print(f"mrl-lit dist world={world} dims={dims} "
+                      f"tau+={tau_label} ls={ls}")
+            check(f"loss(rank{rank})", total, ref.detach(), tol)
+            check(f"dX(rank{rank})", xs.grad, xr.grad[rows], tol)
+            assert ys.grad is None, "locked image tower must receive no gradient"
+            dist.barrier()
+    _mrl._FORCE_BACKWARD = None
+    dist.destroy_process_group()
+
+
 if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = False
-    run_wrapper()
-    for force in ("prefix", "telescope", "fa"):   # every backward kernel, full matrix
-        _mrl._FORCE_BACKWARD = force
-        print(f"--- fused suites, {force} backward ---")
-        run_fused()
-    _mrl._FORCE_BACKWARD = None
-    print("ALL OK")
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        run_distributed()
+    else:
+        run_wrapper()
+        run_dist_world1()
+        for force in ("prefix", "telescope", "fa"):   # every backward kernel
+            _mrl._FORCE_BACKWARD = force
+            print(f"--- fused suites, {force} backward ---")
+            run_fused()
+        _mrl._FORCE_BACKWARD = None
+        print("ALL OK")

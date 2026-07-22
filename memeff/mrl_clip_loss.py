@@ -10,8 +10,9 @@ per-dim COLUMN denominators and the gradient coefficients sum the row and
 column softmax probabilities. LiT is the row-only, text-tower-only special
 case (TWO_SIDED=False prunes every column-side instruction).
 
-Single-GPU modules only; for DDP wrap the distributed CLIP/LiT losses in
-memeff.matryoshka.MatryoshkaLoss.
+Single-GPU modules; the DDP counterparts (one ring pass for all dims, same
+tile kernels launched rectangularly) live in distributed_mrl_clip_loss.py.
+For unaligned dims wrap the plain losses in memeff.matryoshka.MatryoshkaLoss.
 """
 import math
 import torch

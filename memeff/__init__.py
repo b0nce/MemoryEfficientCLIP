@@ -3,7 +3,7 @@
 `pip install memeff`, then `from memeff import MemoryEfficientCLIPLoss` -- every
 public class is re-exported here.
 """
-__version__ = "0.2.0"
+__version__ = "0.3.1"
 
 from .clip_loss import MemoryEfficientCLIPLoss, StableMemoryEfficientCLIPLoss
 from .lit_loss import MemoryEfficientLiTLoss, StableMemoryEfficientLiTLoss
@@ -18,6 +18,12 @@ from .mrl_qwen3_loss import (
     MemoryEfficientMatryoshkaQwen3Loss, MemoryEfficientMatryoshkaLiTQwen3Loss)
 from .mrl_clip_loss import (
     MemoryEfficientMatryoshkaCLIPLoss, MemoryEfficientMatryoshkaLiTLoss)
+from .distributed_mrl_qwen3_loss import (
+    DistributedMemoryEfficientMatryoshkaQwen3Loss,
+    DistributedMemoryEfficientMatryoshkaLiTQwen3Loss)
+from .distributed_mrl_clip_loss import (
+    DistributedMemoryEfficientMatryoshkaCLIPLoss,
+    DistributedMemoryEfficientMatryoshkaLiTLoss)
 
 __all__ = [
     "MemoryEfficientCLIPLoss",
@@ -35,4 +41,8 @@ __all__ = [
     "MemoryEfficientMatryoshkaLiTQwen3Loss",
     "MemoryEfficientMatryoshkaCLIPLoss",
     "MemoryEfficientMatryoshkaLiTLoss",
+    "DistributedMemoryEfficientMatryoshkaQwen3Loss",
+    "DistributedMemoryEfficientMatryoshkaLiTQwen3Loss",
+    "DistributedMemoryEfficientMatryoshkaCLIPLoss",
+    "DistributedMemoryEfficientMatryoshkaLiTLoss",
 ]

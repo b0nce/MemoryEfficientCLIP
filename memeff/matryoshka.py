@@ -10,10 +10,11 @@ class MatryoshkaLoss(nn.Module):
 
     Runs K separate loss passes, so memory stays O(batch * dim) but compute
     (and, for the distributed losses, communication) scales with sum(dims).
-    The fused single-pass variant for the Qwen3 losses lives in
-    mrl_qwen3_loss.py; this wrapper is its correctness oracle and covers every
-    other loss class, the DDP modules, and any dims the kernels accept
-    (>= 16, powers of two below 64 -- no chunk alignment needed).
+    The fused single-pass variants live in mrl_qwen3_loss.py /
+    mrl_clip_loss.py (single GPU) and distributed_mrl_qwen3_loss.py /
+    distributed_mrl_clip_loss.py (DDP, one ring pass); this wrapper is their
+    correctness oracle and covers any dims the kernels accept (>= 16, powers
+    of two below 64 -- no chunk alignment needed).
 
     The wrapped loss must have normalized_inputs=False: prefix slices must be
     re-normalized, and a loss that trusts its inputs' norms would silently

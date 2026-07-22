@@ -18,11 +18,14 @@ import os
 os.environ.setdefault("MEMEFF_INPUT_PRECISION", "ieee")   # must precede the imports
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from memeff import (MatryoshkaLoss, MemoryEfficientMatryoshkaQwen3Loss,
                     MemoryEfficientMatryoshkaLiTQwen3Loss,
-                    MemoryEfficientQwen3Loss)
+                    MemoryEfficientQwen3Loss,
+                    DistributedMemoryEfficientMatryoshkaQwen3Loss,
+                    DistributedMemoryEfficientMatryoshkaLiTQwen3Loss)
 from test_qwen3_loss import (TAU, MARGIN, DIM, ambiguous_rows, check, debias_on,
                              leafs, make_inputs, make_tau_row, reference_loss)
 
@@ -176,6 +179,149 @@ def run_wrapper():
             check("dH", hk.grad[kq], hr.grad[kq], 1e-3)
 
 
+def run_dist_world1():
+    """The fused distributed modules at world=1 (no process group): every
+    kernel launch and eager term minus the collectives."""
+    for K, use_qq, use_dd, tau_plus, ls in [(4, True, True, 0.0, 0.0),
+                                            (4, True, True, 0.3, 0.1),
+                                            (0, False, False, 0.0, 0.0)]:
+        w = (1.0,) * len(DIMS3)
+        q, d, h = make_inputs(1024, K, torch.float32, pos_dupes=debias_on(tau_plus))
+        bad_q, bad_d = mrl_ambiguous(q, d, h, DIMS3, use_qq, use_dd)
+        kq, kd = ~bad_q, ~bad_d
+        qr, dr, hr = leafs(q, d, h)
+        ref = reference_mrl(qr, dr, hr, DIMS3, w, use_qq=use_qq, use_dd=use_dd,
+                            tau_plus=tau_plus, label_smoothing=ls)
+        ref.backward()
+        loss_fn = DistributedMemoryEfficientMatryoshkaQwen3Loss(
+            DIMS3, temperature=TAU, margin=MARGIN, use_qq_negatives=use_qq,
+            use_dd_negatives=use_dd, normalized_inputs=True, stable=False,
+            tau_plus=tau_plus, label_smoothing=ls)
+        qk, dk, hk = leafs(q, d, h)
+        loss = loss_fn(qk, dk, hk)
+        loss.backward()
+        print(f"mrl-clip dist world=1 K={K} qq={use_qq} dd={use_dd} "
+              f"tau+={tau_plus} ls={ls} amb={int(bad_q.sum())}q/{int(bad_d.sum())}d")
+        check("loss", loss.detach(), ref.detach(), 1e-3)
+        check("dQ", qk.grad[kq], qr.grad[kq], 1e-3)
+        check("dD", dk.grad[kd], dr.grad[kd], 1e-3)
+        if hk is not None:
+            check("dH", hk.grad[kq], hr.grad[kq], 1e-3)
+
+    q, d, h = make_inputs(1024, 4, torch.float32)
+    bad_q, _ = mrl_ambiguous(q, d, h, DIMS3, use_qq=True)
+    kq = ~bad_q
+    w = (1.0,) * len(DIMS3)
+    qr = q.detach().requires_grad_(True)
+    ref = reference_mrl(qr, d, h, DIMS3, w, use_qq=True)
+    ref.backward()
+    loss_fn = DistributedMemoryEfficientMatryoshkaLiTQwen3Loss(
+        DIMS3, temperature=TAU, margin=MARGIN, use_qq_negatives=True,
+        normalized_inputs=True, stable=False)
+    qk = q.detach().requires_grad_(True)
+    loss = loss_fn(qk, d, h)
+    loss.backward()
+    print(f"mrl-lit dist world=1 qq=True amb={int(bad_q.sum())}q")
+    check("loss", loss.detach(), ref.detach(), 1e-3)
+    check("dQ", qk.grad[kq], qr.grad[kq], 1e-3)
+
+
+def run_distributed():
+    import memeff.mrl_qwen3_loss as _mrl
+
+    dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    torch.cuda.set_device(rank)
+    local_b = 512
+    B = world * local_b
+    rows = slice(rank * local_b, (rank + 1) * local_b)
+    tol = 1e-3
+
+    for force in ("prefix", "telescope"):   # both tile backends over the ring
+        _mrl._FORCE_BACKWARD = force
+        if rank == 0:
+            print(f"--- mrl distributed suites, {force} backward ---")
+        for dims, K, use_qq, use_dd, stable, tau_label, ls in [
+                (DIMS3, 0, False, False, False, 0.0, 0.0),
+                (DIMS3, 4, True, True, False, 0.0, 0.0),
+                (DIMS2, 4, True, True, True, 0.0, 0.0),
+                (DIMS3, 4, True, True, False, 0.3, 0.0),
+                (DIMS3, 4, True, True, False, "row", 0.0),
+                (DIMS3, 4, True, True, False, 0.0, 0.1),
+                (DIMS3, 4, True, True, True, 0.3, 0.1)]:
+            # identical global batch on every rank, each takes its shard
+            w = (1.0,) * len(dims)
+            per_row = tau_label == "row"
+            tau_plus = make_tau_row(B) if per_row else tau_label   # same seed everywhere
+            q, d, h = make_inputs(B, K, torch.float32, seed=7,
+                                  pos_dupes=debias_on(tau_plus))
+            bad_q, bad_d = mrl_ambiguous(q, d, h, dims, use_qq, use_dd)
+            kq, kd = ~bad_q[rows], ~bad_d[rows]
+            qr, dr, hr = leafs(q, d, h)
+            ref = reference_mrl(qr, dr, hr, dims, w, use_qq=use_qq, use_dd=use_dd,
+                                tau_plus=tau_plus, label_smoothing=ls)
+            ref.backward()
+
+            loss_fn = DistributedMemoryEfficientMatryoshkaQwen3Loss(
+                dims, temperature=TAU, margin=MARGIN, use_qq_negatives=use_qq,
+                use_dd_negatives=use_dd, normalized_inputs=True, stable=stable,
+                tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
+            qs, ds, hs = leafs(q[rows], d[rows], h[rows] if h is not None else None)
+            partial = loss_fn(qs, ds, hs,
+                              tau_plus=tau_plus[rows] if per_row else None)
+            partial.backward()
+            total = partial.detach().clone()
+            dist.all_reduce(total)
+
+            sc = math.sqrt(B * TAU) if stable else 1.0
+            if rank == 0:
+                print(f"mrl-clip dist world={world} dims={dims} K={K} qq={use_qq} "
+                      f"dd={use_dd} stable={stable} tau+={tau_label} ls={ls} "
+                      f"amb={int(bad_q.sum())}q/{int(bad_d.sum())}d")
+            check(f"loss(rank{rank})", total, ref.detach(), tol)
+            check(f"dQ(rank{rank})", qs.grad[kq], qr.grad[rows][kq] * sc, tol)
+            check(f"dD(rank{rank})", ds.grad[kd], dr.grad[rows][kd] * sc, tol)
+            if hs is not None:
+                check(f"dH(rank{rank})", hs.grad[kq], hr.grad[rows][kq] * sc, tol)
+            dist.barrier()
+
+        for dims, K, use_qq, tau_label, ls in [
+                (DIMS3, 0, False, 0.0, 0.0), (DIMS3, 4, True, 0.0, 0.0),
+                (DIMS3, 4, True, 0.3, 0.0), (DIMS3, 4, True, "row", 0.0),
+                (DIMS2, 4, True, 0.0, 0.1)]:
+            w = (1.0,) * len(dims)
+            per_row = tau_label == "row"
+            tau_plus = make_tau_row(B) if per_row else tau_label
+            q, d, h = make_inputs(B, K, torch.float32, seed=11,
+                                  pos_dupes=debias_on(tau_plus))
+            bad_q, _ = mrl_ambiguous(q, d, h, dims, use_qq)
+            kq = ~bad_q[rows]
+            qr = q.detach().requires_grad_(True)
+            ref = reference_mrl(qr, d, h, dims, w, use_qq=use_qq,
+                                tau_plus=tau_plus, label_smoothing=ls)
+            ref.backward()
+
+            loss_fn = DistributedMemoryEfficientMatryoshkaLiTQwen3Loss(
+                dims, temperature=TAU, margin=MARGIN, use_qq_negatives=use_qq,
+                normalized_inputs=True, stable=False,
+                tau_plus=0.0 if per_row else tau_plus, label_smoothing=ls)
+            qs = q[rows].detach().requires_grad_(True)
+            partial = loss_fn(qs, d[rows], h[rows] if h is not None else None,
+                              tau_plus=tau_plus[rows] if per_row else None)
+            partial.backward()
+            total = partial.detach().clone()
+            dist.all_reduce(total)
+
+            if rank == 0:
+                print(f"mrl-lit dist world={world} dims={dims} K={K} qq={use_qq} "
+                      f"tau+={tau_label} ls={ls} amb={int(bad_q.sum())}q")
+            check(f"loss(rank{rank})", total, ref.detach(), tol)
+            check(f"dQ(rank{rank})", qs.grad[kq], qr.grad[rows][kq], tol)
+            dist.barrier()
+    _mrl._FORCE_BACKWARD = None
+    dist.destroy_process_group()
+
+
 def run_asserts():
     """Misaligned / unsorted / non-terminal dims must fail loudly."""
     q, d, _ = make_inputs(256, 0, torch.float32)
@@ -207,12 +353,16 @@ if __name__ == "__main__":
     import memeff.mrl_qwen3_loss as _mrl
 
     torch.backends.cuda.matmul.allow_tf32 = False
-    run_asserts()
-    run_wrapper()
-    for force in ("prefix", "telescope", "fa"):   # every backward kernel, full matrix
-        _mrl._FORCE_BACKWARD = force
-        print(f"--- fused suites, {force} backward ---")
-        run_fused_clip()
-        run_fused_lit()
-    _mrl._FORCE_BACKWARD = None
-    print("ALL OK")
+    if int(os.environ.get("WORLD_SIZE", "1")) > 1:
+        run_distributed()
+    else:
+        run_asserts()
+        run_wrapper()
+        run_dist_world1()
+        for force in ("prefix", "telescope", "fa"):   # every backward kernel
+            _mrl._FORCE_BACKWARD = force
+            print(f"--- fused suites, {force} backward ---")
+            run_fused_clip()
+            run_fused_lit()
+        _mrl._FORCE_BACKWARD = None
+        print("ALL OK")

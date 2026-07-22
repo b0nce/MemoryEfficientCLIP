@@ -28,8 +28,10 @@ scheduling/regalloc up to minutes per variant (measured: ~2 min/kernel at
 D=256); the rolled form compiles like the non-MRL kernels and shares one binary
 across all same-K dim ladders.
 
-Single-GPU modules only for now; for DDP wrap the distributed Qwen3 losses in
-memeff.matryoshka.MatryoshkaLoss (K ring passes instead of one).
+Single-GPU modules; the DDP counterparts (one ring pass for all dims, same
+tile kernels launched rectangularly) live in distributed_mrl_qwen3_loss.py.
+For unaligned dims wrap the plain losses in memeff.matryoshka.MatryoshkaLoss
+(K passes instead of one).
 """
 import math
 import torch
