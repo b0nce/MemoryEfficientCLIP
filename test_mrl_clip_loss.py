@@ -124,7 +124,7 @@ def run_wrapper():
 if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_tf32 = False
     run_wrapper()
-    for force in ("prefix", "telescope"):   # both backward kernels, full matrix
+    for force in ("prefix", "telescope", "fa"):   # every backward kernel, full matrix
         _mrl._FORCE_BACKWARD = force
         print(f"--- fused suites, {force} backward ---")
         run_fused()

@@ -1,8 +1,9 @@
 """Fused matryoshka (MRL, arXiv 2205.13147) CLIP and LiT losses.
 
 Same design as mrl_qwen3_loss (cumulative prefix dots, per-row scalar
-re-normalization, all K denominators snapshotted in one sweep, backward picks
-between prefix-emission and telescoping kernels) with the plain CLIP/LiT
+re-normalization, all K denominators snapshotted in one sweep, backward runs
+the FA-shaped launches within the FA cap and picks between the atomic
+prefix-emission and telescoping kernels above it) with the plain CLIP/LiT
 semantics: no false-negative mask, no hard negatives, and -- the structural
 difference -- the CLIP loss is bidirectional, so the kernels also accumulate
 per-dim COLUMN denominators and the gradient coefficients sum the row and
@@ -34,6 +35,8 @@ from ._common import (
 )
 from .mrl_qwen3_loss import (
     check_mrl_dims,
+    launch_mrl_fa_grad as _launch_mrl_fa_grad,
+    use_fa_backward as _use_fa_backward,
     _dims_tensor,
     _prefix_inv_norms,
     _prefix_pos,
@@ -356,9 +359,29 @@ class MemoryEfficientMRLCLIPLossNormed(torch.autograd.Function):
         rho_x = torch.zeros(K, batch_size, device=device, dtype=torch.float32)
         rho_y = None if lit else torch.zeros_like(rho_x)
 
-        launch_mrl_clip_grad(x, y, dims, dims_t, a_inv, b_inv, div_row, div_col,
-                             w_vec, dX, dY, rho_x, rho_y,
-                             inv_temperature, grad_scale, two_sided=not lit)
+        if _use_fa_backward(d_model, device, x.dtype):
+            # Per-launch orientation: the own-side divisor is the launch
+            # tower's softmax (row for x, column for y), the other-side
+            # divisor the streamed tower's. No false-negative mask, so the
+            # pos table argument is a dummy (has_mask prunes its loads);
+            # LiT drops the column softmax and the whole y launch.
+            div_r = div_row
+            div_c = div_row if div_col is None else div_col
+            _launch_mrl_fa_grad(x, y, dims, weights, a_inv, b_inv, div_r,
+                                div_r, div_c, dX, rho_x, inv_temperature, 0.0,
+                                grad_scale, own_side=True,
+                                other_side=not lit, has_mask=False,
+                                exclude_diag=False)
+            if not lit:
+                _launch_mrl_fa_grad(y, x, dims, weights, b_inv, a_inv, div_r,
+                                    div_c, div_r, dY, rho_y, inv_temperature,
+                                    0.0, grad_scale, own_side=True,
+                                    other_side=True, has_mask=False,
+                                    exclude_diag=False)
+        else:
+            launch_mrl_clip_grad(x, y, dims, dims_t, a_inv, b_inv, div_row, div_col,
+                                 w_vec, dX, dY, rho_x, rho_y,
+                                 inv_temperature, grad_scale, two_sided=not lit)
 
         # Eager positive-pair seeds through the prefix-renormalization Jacobian
         # a^k (I - p p^T); the kernels' emissions carry a^k * b^k inside their

@@ -4,15 +4,18 @@ dim trained in (almost) one pass over the similarity blocks.
 Raw prefix dots are cumulative across the kernels' feature chunks, and each
 prefix's re-normalization is a per-row scalar (a_i^k = 1/||x_i[:m_k]||), so the
 denom kernel rescales its running dot tile at every prefix boundary and
-accumulates all K denominators in a single sweep. The backward picks between
-two kernels per ladder (see _use_prefix_emission): a single walk that emits
-each boundary's prefix gradient immediately (extra prefix matmuls on
-cache-hot chunks, every exp2/mask sweep run once -- wins at small d_model,
-where the sweeps dominate), or two walks with a telescoping coefficient tile
-(minimal matmuls, K - 1 extra peel sweeps -- wins at large d_model). Either
-way the extra state is O(K * batch) scalar tables (inverse prefix norms,
-per-dim positives/divisors, renormalization row sums) -- no per-dim feature
-copies, no per-dim gradient buffers.
+accumulates all K denominators in a single sweep. For d_model within the FA
+cap (see _common.fa_ok) the backward runs FlashAttention-shaped launches --
+one per (output tower, similarity block), gradient and rho rows accumulated
+in registers, zero atomics (mrl_fa_grad_kernel). Above the cap it picks
+between two atomic tile kernels per ladder (see _use_prefix_emission): a
+single walk that emits each boundary's prefix gradient immediately (extra
+prefix matmuls on cache-hot chunks, every exp2/mask sweep run once -- wins at
+small d_model, where the sweeps dominate), or two walks with a telescoping
+coefficient tile (minimal matmuls, K - 1 extra peel sweeps -- wins at large
+d_model). Either way the extra state is O(K * batch) scalar tables (inverse
+prefix norms, per-dim positives/divisors, renormalization row sums) -- no
+per-dim feature copies, no per-dim gradient buffers.
 
 Prefix dims must be strictly increasing multiples of the kernels' feature chunk
 (64 for d_model >= 64) and end exactly at d_model; anything else raises, by
@@ -41,6 +44,8 @@ from ._common import (
     LOG2E as _LOG2E,
     backward_blocks as _backward_blocks,
     check_dims as _check_dims,
+    fa_blocks as _fa_blocks,
+    fa_ok as _fa_ok,
     debias_denominators as _debias_denominators,
     qwen3_num_negatives as _num_negatives,
     qwen3_smoothing_term as _qwen3_smoothing_term,
@@ -353,6 +358,96 @@ def mrl_qwen3_grad_prefix_kernel(
         lo = hi
 
 
+@triton.jit
+def mrl_fa_grad_kernel(
+    A_ptr, B_ptr, a_inv_ptr, b_inv_ptr, pos_ptr, div_own_ptr, div_other_ptr,
+    dA_ptr, rho_ptr,
+    inv_temperature, margin, grad_scale, n_own, n_other,
+    HAS_MASK: tl.constexpr, OWN_SIDE: tl.constexpr, OTHER_SIDE: tl.constexpr,
+    EXCLUDE_DIAG: tl.constexpr,
+    BLOCK_SIZE_I: tl.constexpr, BLOCK_SIZE_J: tl.constexpr,
+    D_POW2: tl.constexpr, D_PREFIX: tl.constexpr, D_STRIDE: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+):
+    """FlashAttention-shaped MRL gradient, ONE prefix boundary per launch: the
+    program owns rows [pid * BLOCK_I, ...) of tower A, streams every B block
+    restricted to this boundary's prefix (D_PREFIX = m_k features at row
+    stride D_STRIDE = d_model, dots sized D_POW2 = next_pow2(m_k)) and
+    accumulates dA[:, :m_k] += sum_j c_ij * B_j[:m_k] in registers -- no
+    gradient atomics, one read-modify-write per owned row, and the same RMW
+    for this boundary's rho row (the c . R row sums the eager
+    re-normalization correction needs). A register-masked full-width variant
+    that fused all K boundaries into one launch ran 23x SLOWER than the tile
+    kernels (A100, 2026-07-22): the prefix-masked B tile became
+    register-resident and every boundary's two dots round-tripped it through
+    SMEM, so keep B feeding the dots straight from its load and pay the
+    K-fold restream instead -- boundary launches also size their dots by
+    next_pow2(m_k) rather than the full width, and per-boundary w_k *
+    grad_scale folds into the scalar.
+
+    One kernel serves both loss families: HAS_MASK enables the Qwen3
+    false-negative keep mask (pos/margin), OWN_SIDE / OTHER_SIDE add the
+    softmax terms whose divisors (and pos rows, iff HAS_MASK) are indexed by
+    the owned / streamed rows -- Qwen3 passes this boundary's div row twice,
+    CLIP its row/col rows per launch orientation; the self blocks (q-q / d-d)
+    enable both sides plus EXCLUDE_DIAG. All 0/1 masks multiply as floats
+    (tl.where trips the triton 3.1 select-layout bug) and 1D loads use
+    clamped indices; out-of-range streamed rows load zero features, so their
+    finite prob dies in both the emission dot and the c * R rho product."""
+    pid = tl.program_id(0)
+    i_offsets = pid * BLOCK_SIZE_I + tl.arange(0, BLOCK_SIZE_I)
+    d_offsets = tl.arange(0, D_POW2)
+    i_mask = i_offsets < n_own
+    d_mask = d_offsets < D_PREFIX
+    i_clamped = tl.minimum(i_offsets, n_own - 1)
+    out_offsets = i_offsets[:, None] * D_STRIDE + d_offsets[None, :]
+    out_mask = i_mask[:, None] & d_mask[None, :]
+
+    A_own = tl.load(A_ptr + out_offsets, mask=out_mask, other=0.0)
+    a_own = tl.load(a_inv_ptr + i_clamped)
+    if OWN_SIDE:
+        div_own = tl.load(div_own_ptr + i_clamped)
+        if HAS_MASK:
+            pos_own = tl.load(pos_ptr + i_clamped)
+    acc = tl.zeros([BLOCK_SIZE_I, D_POW2], dtype=tl.float32)
+    rho = tl.zeros([BLOCK_SIZE_I], dtype=tl.float32)
+
+    for j_start in range(0, n_other, BLOCK_SIZE_J):
+        j_offsets = j_start + tl.arange(0, BLOCK_SIZE_J)
+        j_clamped = tl.minimum(j_offsets, n_other - 1)
+        B_block = tl.load(B_ptr + (j_offsets[:, None] * D_STRIDE + d_offsets[None, :]),
+                          mask=((j_offsets[:, None] < n_other) & d_mask[None, :]),
+                          other=0.0)
+        R = tl.dot(A_own, tl.trans(B_block), input_precision=INPUT_PRECISION)
+        b_str = tl.load(b_inv_ptr + j_clamped)
+        S = R * a_own[:, None] * b_str[None, :]
+        exp_S = tl.exp2(S * inv_temperature - inv_temperature)
+        prob = tl.zeros([BLOCK_SIZE_I, BLOCK_SIZE_J], dtype=tl.float32)
+        if OWN_SIDE:
+            term = tl.math.fdiv(exp_S, div_own[:, None])
+            if HAS_MASK:
+                term *= (S <= pos_own[:, None] + margin).to(tl.float32)
+            prob += term
+        if OTHER_SIDE:
+            div_str = tl.load(div_other_ptr + j_clamped)
+            term = tl.math.fdiv(exp_S, div_str[None, :])
+            if HAS_MASK:
+                pos_str = tl.load(pos_ptr + j_clamped)
+                term *= (S <= pos_str[None, :] + margin).to(tl.float32)
+            prob += term
+        if EXCLUDE_DIAG:
+            prob *= (i_offsets[:, None] != j_offsets[None, :]).to(tl.float32)
+        c = prob * (grad_scale * a_own[:, None] * b_str[None, :])
+        rho += tl.sum(c * R, axis=1)
+        acc = tl.dot(c.to(A_ptr.dtype.element_ty), B_block, acc,
+                     input_precision=INPUT_PRECISION)
+
+    acc += tl.load(dA_ptr + out_offsets, mask=out_mask, other=0.0)
+    tl.store(dA_ptr + out_offsets, acc, mask=out_mask)
+    rho += tl.load(rho_ptr + i_clamped)
+    tl.store(rho_ptr + i_offsets, rho, mask=i_mask)
+
+
 def launch_mrl_denom(a, b, dims_t, a_inv, b_inv, pos, sum_exp, inv_temperature,
                      margin, exclude_diag=False, row_offset=0, col_offset=0):
     n_i, d_model = a.shape
@@ -371,7 +466,60 @@ def launch_mrl_denom(a, b, dims_t, a_inv, b_inv, pos, sum_exp, inv_temperature,
 # One boundary sweep (exp2/mask/atomics over a B^2 tile) costs about as much
 # as this many 64-wide matmul chunk passes (A100, bf16, D=384, 2026-07).
 _SWEEP_CHUNK_COST = 5
-_FORCE_BACKWARD = None  # 'prefix' | 'telescope' -- test hook
+_FORCE_BACKWARD = None  # 'prefix' | 'telescope' | 'fa' -- test hook
+
+# Per-boundary block overrides, keyed (d_pow2, wide) where d_pow2 =
+# next_pow2(m_k) (min 512) and wide = 4-byte inputs. bf16/fp16 boundaries
+# fall back to the plain per-arch FA tables (the kernel has the same SMEM /
+# register shape as the plain FA kernels); fp32 needs its own entries because
+# its staged loads are twice the size (sm80 budget: stages * BJ * d_pow2 *
+# 4B + the BI-row A tile in registers).
+_MRL_FA_BLOCKS = {
+    (512, True): (32, 32, 8, 2),      # 128 KB SMEM
+    (1024, True): (16, 16, 8, 2),     # 128 KB
+}
+
+
+def _mrl_fa_blocks(device, m, dtype):
+    d_pow2 = max(512, triton.next_power_of_2(m))
+    wide = dtype.itemsize >= 4
+    cfg = _MRL_FA_BLOCKS.get((d_pow2, wide))
+    if cfg is None and not wide:
+        cfg = _fa_blocks(device, m)
+    return cfg
+
+
+def use_fa_backward(d_model, device, dtype):
+    if _FORCE_BACKWARD is not None:
+        if _FORCE_BACKWARD != 'fa':
+            return False
+    elif not _fa_ok(d_model, device):
+        return False
+    return _mrl_fa_blocks(device, d_model, dtype) is not None
+
+
+def launch_mrl_fa_grad(a, b, dims, weights, a_inv, b_inv, pos, div_own,
+                       div_other, dA, rho, inv_temperature, margin, grad_scale,
+                       *, own_side, other_side, has_mask, exclude_diag):
+    """One tower's gradient rows (and rho rows) accumulated into the
+    pre-seeded fp32 buffers: one plain-FA-shaped launch per prefix boundary,
+    each sized next_pow2(m_k) with that boundary's rows of the (K, batch)
+    tables and w_k folded into the scalar. pos is ignored when has_mask is
+    False (pass any same-shape table)."""
+    n_own, d_model = a.shape
+    for k, m in enumerate(dims):
+        block_i, block_j, num_warps, num_stages = _mrl_fa_blocks(a.device, m, a.dtype)
+        grid = (triton.cdiv(n_own, block_i),)
+        mrl_fa_grad_kernel[grid](
+            a, b, a_inv[k], b_inv[k], pos[k], div_own[k], div_other[k],
+            dA, rho[k],
+            inv_temperature, margin, weights[k] * grad_scale, n_own, b.shape[0],
+            HAS_MASK=has_mask, OWN_SIDE=own_side, OTHER_SIDE=other_side,
+            EXCLUDE_DIAG=exclude_diag,
+            BLOCK_SIZE_I=block_i, BLOCK_SIZE_J=block_j,
+            D_POW2=triton.next_power_of_2(m), D_PREFIX=m, D_STRIDE=d_model,
+            INPUT_PRECISION=_INPUT_PRECISION,
+            num_warps=num_warps, num_stages=num_stages)
 
 
 def _use_prefix_emission(dims, d_model, two_sided, block_d):
@@ -488,20 +636,46 @@ class MemoryEfficientMRLQwen3LossNormed(torch.autograd.Function):
         rho_q = torch.zeros(K, batch_size, device=device, dtype=torch.float32)
         rho_d = None if lit else torch.zeros_like(rho_q)
 
-        launch_mrl_grad(q, d, dims, dims_t, a_inv, b_inv, pos, div, w_vec,
-                        dQ, dQ if lit else dD, rho_q, rho_q if lit else rho_d,
-                        inv_temperature, margin, grad_scale,
-                        two_sided=not lit)
-        if ctx.use_qq:
-            launch_mrl_grad(q, q, dims, dims_t, a_inv, a_inv, pos, div, w_vec,
-                            dQ, dQ, rho_q, rho_q,
+        if use_fa_backward(d_model, device, q.dtype):
+            # One FA launch per (output tower, similarity block): q.d row side
+            # feeds dQ, its transposed role feeds dD, the self blocks feed
+            # their tower from both roles at once (rows and columns index the
+            # same batch, so one pos/div table serves both).
+            launch_mrl_fa_grad(q, d, dims, weights, a_inv, b_inv, pos, div,
+                               div, dQ, rho_q, inv_temperature, margin,
+                               grad_scale, own_side=True, other_side=False,
+                               has_mask=True, exclude_diag=False)
+            if ctx.use_qq:
+                launch_mrl_fa_grad(q, q, dims, weights, a_inv, a_inv, pos, div,
+                                   div, dQ, rho_q, inv_temperature, margin,
+                                   grad_scale, own_side=True, other_side=True,
+                                   has_mask=True, exclude_diag=True)
+            if not lit:
+                launch_mrl_fa_grad(d, q, dims, weights, b_inv, a_inv, pos, div,
+                                   div, dD, rho_d, inv_temperature, margin,
+                                   grad_scale, own_side=False, other_side=True,
+                                   has_mask=True, exclude_diag=False)
+                if ctx.use_dd:
+                    launch_mrl_fa_grad(d, d, dims, weights, b_inv, b_inv, pos,
+                                       div, div, dD, rho_d, inv_temperature,
+                                       margin, grad_scale, own_side=True,
+                                       other_side=True, has_mask=True,
+                                       exclude_diag=True)
+        else:
+            launch_mrl_grad(q, d, dims, dims_t, a_inv, b_inv, pos, div, w_vec,
+                            dQ, dQ if lit else dD, rho_q, rho_q if lit else rho_d,
                             inv_temperature, margin, grad_scale,
-                            exclude_diag=True, two_sided=True)
-        if ctx.use_dd:
-            launch_mrl_grad(d, d, dims, dims_t, b_inv, b_inv, pos, div, w_vec,
-                            dD, dD, rho_d, rho_d,
-                            inv_temperature, margin, grad_scale,
-                            exclude_diag=True, two_sided=True)
+                            two_sided=not lit)
+            if ctx.use_qq:
+                launch_mrl_grad(q, q, dims, dims_t, a_inv, a_inv, pos, div, w_vec,
+                                dQ, dQ, rho_q, rho_q,
+                                inv_temperature, margin, grad_scale,
+                                exclude_diag=True, two_sided=True)
+            if ctx.use_dd:
+                launch_mrl_grad(d, d, dims, dims_t, b_inv, b_inv, pos, div, w_vec,
+                                dD, dD, rho_d, rho_d,
+                                inv_temperature, margin, grad_scale,
+                                exclude_diag=True, two_sided=True)
 
         # Eager per-dim terms, all O(batch * sum(dims)): the positive-pair
         # seeds and hard-negative pulls go through the prefix-renormalization
